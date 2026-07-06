@@ -23,6 +23,8 @@ import {
   exportNativeAudio,
   exportNativeTranscript,
   getWhisperModelStatus,
+  listNativeAudioInputDevices,
+  listNativeAudioOutputDevices,
   loadWhisperModel,
   onTranscriptSegment,
   openNativeMeetingFolder,
@@ -34,8 +36,42 @@ import {
   startNativeRecording,
   stopNativeRecording,
   setNativeMiniMode,
+  updateNativeMeetingLanguage,
 } from './nativeClient';
 import { formatTimestamp } from './exporters';
+
+const LANGUAGE_OPTIONS = [
+  { value: 'auto', label: 'Auto detect' },
+  { value: 'en', label: 'English' },
+  { value: 'ko', label: 'Korean' },
+  { value: 'ja', label: 'Japanese' },
+  { value: 'zh', label: 'Chinese' },
+  { value: 'es', label: 'Spanish' },
+  { value: 'fr', label: 'French' },
+  { value: 'de', label: 'German' },
+];
+
+const STOP_RECORDING_TIMEOUT_MS = 10_000;
+
+const CAPTURE_MODE_OPTIONS = [
+  { value: 'microphoneSystem', label: 'Microphone + system' },
+  { value: 'microphone', label: 'Microphone only' },
+  { value: 'system', label: 'System audio only' },
+];
+
+function getLanguageLabel(language: string): string {
+  return LANGUAGE_OPTIONS.find((option) => option.value === language)?.label ?? language.toUpperCase();
+}
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === 'string') {
+    return error;
+  }
+  return fallback;
+}
 
 function upsertMeeting(meetings: Meeting[], meeting: Meeting): Meeting[] {
   const existing = meetings.findIndex((item) => item.id === meeting.id);
@@ -43,7 +79,11 @@ function upsertMeeting(meetings: Meeting[], meeting: Meeting): Meeting[] {
     return [meeting, ...meetings];
   }
   const next = [...meetings];
-  next[existing] = meeting;
+  const current = next[existing];
+  next[existing] = {
+    ...meeting,
+    transcript: meeting.transcript.length >= current.transcript.length ? meeting.transcript : current.transcript,
+  };
   return next.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
 }
 
@@ -101,16 +141,24 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showRecordingList, setShowRecordingList] = useState(false);
+  const [pendingMeetingId, setPendingMeetingId] = useState<string | null>(null);
   const [miniMode, setMiniMode] = useState(false);
   const [playingMeetingId, setPlayingMeetingId] = useState<string | null>(null);
   const [playingSegmentId, setPlayingSegmentId] = useState<string | null>(null);
   const [playbackPaused, setPlaybackPaused] = useState(false);
-  const [whisperModelStatus, setWhisperModelStatus] = useState('missing');
+  const [whisperModelLoaded, setWhisperModelLoaded] = useState(false);
   const [whisperModelPath, setWhisperModelPath] = useState('');
+  const [audioInputDevices, setAudioInputDevices] = useState([{ id: '', name: 'System default', isDefault: true }]);
+  const [audioOutputDevices, setAudioOutputDevices] = useState([{ id: '', name: 'System default', isDefault: true }]);
+  const [selectedAudioInputId, setSelectedAudioInputId] = useState('');
+  const [selectedSystemAudioOutputId, setSelectedSystemAudioOutputId] = useState('');
+  const [selectedCaptureMode, setSelectedCaptureMode] = useState('microphoneSystem');
+  const [selectedLanguage, setSelectedLanguage] = useState('en');
 
   const elapsedTimerRef = useRef<number | null>(null);
   const activeMeetingIdRef = useRef<string | null>(null);
   const elapsedSecondsRef = useRef(0);
+  const transcriptListRef = useRef<HTMLDivElement | null>(null);
 
   const activeMeeting = useMemo(
     () => meetings.find((meeting) => meeting.id === activeMeetingId) ?? null,
@@ -132,18 +180,23 @@ export default function App() {
     return activeMeeting?.transcript.slice(-7) ?? [];
   }, [activeMeeting]);
 
-  const latestLine = visibleTranscript[visibleTranscript.length - 1]?.text ?? 'Live transcript will appear here.';
-
   useEffect(() => {
     const load = async () => {
       try {
         const storedMeetings = await fetchMeetings();
         setMeetings(storedMeetings);
         const modelStatus = await getWhisperModelStatus();
-        setWhisperModelStatus(modelStatus);
-        if (modelStatus !== 'loaded' && modelStatus !== 'missing') {
-          setWhisperModelPath(modelStatus);
+        setWhisperModelLoaded(modelStatus.loaded);
+        if (modelStatus.path) {
+          setWhisperModelPath(modelStatus.path);
+          if (!modelStatus.loaded) {
+            void ensureWhisperModelLoaded(modelStatus.path, false);
+          }
         }
+        const devices = await listNativeAudioInputDevices();
+        setAudioInputDevices(devices.length > 0 ? devices : [{ id: '', name: 'System default', isDefault: true }]);
+        const outputDevices = await listNativeAudioOutputDevices();
+        setAudioOutputDevices(outputDevices.length > 0 ? outputDevices : [{ id: '', name: 'System default', isDefault: true }]);
       } catch (loadError) {
         setError(loadError instanceof Error ? loadError.message : 'Tauri backend is not available.');
       }
@@ -178,6 +231,13 @@ export default function App() {
   }, [activeMeetingId]);
 
   useEffect(() => {
+    const element = transcriptListRef.current;
+    if (element) {
+      element.scrollTop = element.scrollHeight;
+    }
+  }, [activeMeetingId, activeMeeting?.transcript.length]);
+
+  useEffect(() => {
     return () => {
       if (elapsedTimerRef.current) {
         window.clearInterval(elapsedTimerRef.current);
@@ -193,6 +253,33 @@ export default function App() {
       }
       return upsertMeeting(current, updater(target));
     });
+  };
+
+  const ensureWhisperModelLoaded = async (modelPath: string, showErrors: boolean) => {
+    const trimmedPath = modelPath.trim();
+    if (!trimmedPath) {
+      if (showErrors) {
+        setError('Enter the full path to a local Whisper .bin model file.');
+      }
+      return false;
+    }
+
+    if (whisperModelLoaded && whisperModelPath === trimmedPath) {
+      return true;
+    }
+
+    try {
+      await loadWhisperModel(trimmedPath);
+      setWhisperModelPath(trimmedPath);
+      setWhisperModelLoaded(true);
+      return true;
+    } catch (modelError) {
+      setWhisperModelLoaded(false);
+      if (showErrors) {
+        setError(modelError instanceof Error ? modelError.message : String(modelError));
+      }
+      return false;
+    }
   };
 
   const startTimers = () => {
@@ -219,18 +306,48 @@ export default function App() {
 
   const handleStartRecording = async () => {
     setError(null);
+    setShowRecordingList(false);
     try {
-      const meeting = await startNativeRecording();
+      // Trigger the same load path as the "Load Model" button so the Whisper
+      // model is ready without a manual step. If no path is configured yet, ask
+      // the backend for an auto-detected model. Loading here is best-effort: the
+      // backend also auto-loads/detects a model when recording starts, so we do
+      // not block on a frontend load failure.
+      let modelPath = whisperModelPath.trim();
+      if (!modelPath) {
+        const status = await getWhisperModelStatus();
+        if (status.path) {
+          modelPath = status.path;
+          setWhisperModelPath(status.path);
+        }
+      }
+      if (modelPath) {
+        await ensureWhisperModelLoaded(modelPath, false);
+      }
+      const meeting = await startNativeRecording({
+        audioDeviceId: selectedAudioInputId,
+        systemAudioDeviceId: selectedSystemAudioOutputId,
+        captureMode: selectedCaptureMode,
+        language: selectedLanguage,
+      });
       setMeetings((current) => upsertMeeting(current, meeting));
       setActiveMeetingId(meeting.id);
       activeMeetingIdRef.current = meeting.id;
-      setShowRecordingList(true);
       setElapsedSeconds(0);
       elapsedSecondsRef.current = 0;
       setStatus('recording');
       startTimers();
+      // Reflect the model the backend actually loaded (e.g. an auto-detected one).
+      getWhisperModelStatus()
+        .then((status) => {
+          setWhisperModelLoaded(status.loaded);
+          if (status.path) {
+            setWhisperModelPath(status.path);
+          }
+        })
+        .catch(() => undefined);
     } catch (recordingError) {
-      setError(recordingError instanceof Error ? recordingError.message : 'Native recording could not start.');
+      setError(getErrorMessage(recordingError, 'Native recording could not start.'));
     }
   };
 
@@ -238,7 +355,12 @@ export default function App() {
     setStatus('saving');
     stopTimers();
     try {
-      const meeting = await stopNativeRecording();
+      const meeting = await Promise.race([
+        stopNativeRecording(),
+        new Promise<never>((_, reject) => {
+          window.setTimeout(() => reject(new Error('Timed out while stopping recording.')), STOP_RECORDING_TIMEOUT_MS);
+        }),
+      ]);
       setMeetings((current) => upsertMeeting(current, meeting));
       setStatus('idle');
     } catch (stopError) {
@@ -246,6 +368,31 @@ export default function App() {
       setStatus('recording');
       startTimers();
     }
+  };
+
+  const handleSelectMeeting = (meetingId: string) => {
+    if (meetingId === activeMeetingId) {
+      return;
+    }
+    if (status === 'recording' || status === 'saving') {
+      setPendingMeetingId(meetingId);
+      return;
+    }
+    setActiveMeetingId(meetingId);
+  };
+
+  const handleCancelSwitch = () => {
+    setPendingMeetingId(null);
+  };
+
+  const handleConfirmSwitch = async () => {
+    const targetId = pendingMeetingId;
+    setPendingMeetingId(null);
+    if (!targetId) {
+      return;
+    }
+    await handleStopRecording();
+    setActiveMeetingId(targetId);
   };
 
   const handleExportAudio = async (meeting: Meeting) => {
@@ -333,17 +480,7 @@ export default function App() {
 
   const handleLoadWhisperModel = async () => {
     setError(null);
-    const modelPath = whisperModelPath.trim();
-    if (!modelPath) {
-      setError('Enter the full path to a local Whisper .bin model file.');
-      return;
-    }
-    try {
-      await loadWhisperModel(modelPath);
-      setWhisperModelStatus('loaded');
-    } catch (modelError) {
-      setError(modelError instanceof Error ? modelError.message : String(modelError));
-    }
+    await ensureWhisperModelLoaded(whisperModelPath, true);
   };
 
   const handleBrowseWhisperModel = async () => {
@@ -356,6 +493,38 @@ export default function App() {
     } catch (dialogError) {
       setError(dialogError instanceof Error ? dialogError.message : String(dialogError));
     }
+  };
+
+  const handleRefreshAudioInputs = async () => {
+    try {
+      const devices = await listNativeAudioInputDevices();
+      const nextDevices = devices.length > 0 ? devices : [{ id: '', name: 'System default', isDefault: true }];
+      setAudioInputDevices(nextDevices);
+      if (!nextDevices.some((device) => device.id === selectedAudioInputId)) {
+        setSelectedAudioInputId('');
+      }
+      const outputDevices = await listNativeAudioOutputDevices();
+      const nextOutputDevices = outputDevices.length > 0 ? outputDevices : [{ id: '', name: 'System default', isDefault: true }];
+      setAudioOutputDevices(nextOutputDevices);
+      if (!nextOutputDevices.some((device) => device.id === selectedSystemAudioOutputId)) {
+        setSelectedSystemAudioOutputId('');
+      }
+      setError(null);
+    } catch (deviceError) {
+      setError(deviceError instanceof Error ? deviceError.message : 'Failed to load audio inputs.');
+    }
+  };
+
+  const handleSessionLanguageChange = (meeting: Meeting, language: string) => {
+    updateActiveMeeting((currentMeeting) => ({ ...currentMeeting, language, updatedAt: new Date().toISOString() }));
+    updateNativeMeetingLanguage(meeting.id, language)
+      .then((updatedMeeting) => {
+        setMeetings((current) => upsertMeeting(current, updatedMeeting));
+        setError(null);
+      })
+      .catch((languageError) => {
+        setError(languageError instanceof Error ? languageError.message : 'Failed to save session language.');
+      });
   };
 
   const handleMiniModeChange = (enabled: boolean) => {
@@ -385,18 +554,21 @@ export default function App() {
           </div>
         </header>
 
-        <main className="mini-transcript" aria-live="polite">
-          <MessageSquareText size={15} />
-          <p>{latestLine}</p>
+        <main className="mini-transcript" ref={transcriptListRef} aria-live="polite">
+          {activeMeeting?.transcript.length ? (
+            activeMeeting.transcript.map((segment) => (
+              <div className="mini-transcript-row" key={segment.id}>
+                <span>{formatTimestamp(segment.offsetSeconds)}</span>
+                <p>{segment.text}</p>
+              </div>
+            ))
+          ) : (
+            <div className="mini-transcript-empty">
+              <MessageSquareText size={15} />
+              <p>Live transcript will appear here.</p>
+            </div>
+          )}
         </main>
-
-        {visibleTranscript.length > 1 && (
-          <div className="mini-history">
-            {visibleTranscript.slice(-3, -1).map((segment) => (
-              <span key={segment.id}>{segment.text}</span>
-            ))}
-          </div>
-        )}
       </div>
     );
   }
@@ -404,9 +576,6 @@ export default function App() {
   return (
     <div className={`app-shell ${showRecordingList ? 'list-open' : ''}`}>
       <aside className="rail" aria-label="Primary navigation">
-        <div className="brand-mark" title="Meetly Light">
-          <span>M</span>
-        </div>
         <RecordButton
           className={`rail-button ${status === 'recording' ? 'recording' : ''}`}
           status={status}
@@ -425,7 +594,7 @@ export default function App() {
       </aside>
 
       {showRecordingList && <aside className="meeting-list">
-        <div className="product-name">Meetly Light</div>
+        <div className="product-name">Meetly Lite</div>
         <div className="search-box">
           <Search size={16} />
           <input
@@ -441,7 +610,7 @@ export default function App() {
             <button
               key={meeting.id}
               className={`meeting-card ${meeting.id === activeMeetingId ? 'selected' : ''}`}
-              onClick={() => setActiveMeetingId(meeting.id)}
+              onClick={() => handleSelectMeeting(meeting.id)}
             >
               <span>{meeting.title}</span>
               <small>
@@ -460,12 +629,6 @@ export default function App() {
             <button onClick={() => handleMiniModeChange(true)} title="Mini mode" aria-label="Mini mode">
               <Minimize2 size={16} />
             </button>
-            <button onClick={() => activeMeeting && handleExportTranscript(activeMeeting)} disabled={!activeMeeting} title="Export transcript" aria-label="Export transcript">
-              <FileText size={16} />
-            </button>
-            <button onClick={() => activeMeeting && handleExportAudio(activeMeeting)} disabled={!activeMeeting?.hasAudio} title="Export audio" aria-label="Export audio">
-              <Download size={16} />
-            </button>
             <button onClick={() => setShowSettings((value) => !value)} title="Settings" aria-label="Settings">
               <SlidersHorizontal size={16} />
             </button>
@@ -477,9 +640,70 @@ export default function App() {
         {showSettings && (
           <aside className="settings-panel" aria-label="Settings panel">
             <div className="settings-intro">
-              <span className="section-kicker">Meetly Light</span>
+              <span className="section-kicker">Meetly Lite</span>
               <h2>Settings</h2>
               <p>Local transcription runs in the Rust backend. Configure the model before recording.</p>
+            </div>
+            <div className="settings-card primary">
+              <div>
+                <h3>Session Defaults</h3>
+                <p>Choose the input and language used when the next recording starts.</p>
+              </div>
+              <label>
+                Capture Mode
+                <select
+                  value={selectedCaptureMode}
+                  onChange={(event) => setSelectedCaptureMode(event.target.value)}
+                  disabled={status !== 'idle'}
+                >
+                  {CAPTURE_MODE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Audio Input
+                <div className="path-picker-row">
+                  <select
+                    value={selectedAudioInputId}
+                    onChange={(event) => setSelectedAudioInputId(event.target.value)}
+                    disabled={status !== 'idle' || selectedCaptureMode === 'system'}
+                  >
+                    {audioInputDevices.map((device) => (
+                      <option key={device.id || 'default'} value={device.id}>
+                        {device.name}{device.isDefault && device.id ? ' (default)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                  <button type="button" onClick={handleRefreshAudioInputs} disabled={status !== 'idle'}>Refresh</button>
+                </div>
+              </label>
+              <label>
+                System Audio
+                <select
+                  value={selectedSystemAudioOutputId}
+                  onChange={(event) => setSelectedSystemAudioOutputId(event.target.value)}
+                  disabled={status !== 'idle' || selectedCaptureMode === 'microphone'}
+                >
+                  {audioOutputDevices.map((device) => (
+                    <option key={device.id || 'default'} value={device.id}>
+                      {device.name}{device.isDefault && device.id ? ' (default)' : ''}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Session Language
+                <select
+                  value={selectedLanguage}
+                  onChange={(event) => setSelectedLanguage(event.target.value)}
+                  disabled={status !== 'idle'}
+                >
+                  {LANGUAGE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
             </div>
             <div className="settings-card primary">
               <div>
@@ -498,7 +722,9 @@ export default function App() {
                 </div>
               </label>
               <div className="settings-action-row">
-                <span className={`model-status ${whisperModelStatus === 'loaded' ? 'loaded' : ''}`}>{whisperModelStatus}</span>
+                <span className={`model-status ${whisperModelLoaded ? 'loaded' : ''}`}>
+                  {whisperModelLoaded ? 'loaded' : whisperModelPath ? 'not loaded' : 'missing'}
+                </span>
                 <button type="button" onClick={handleLoadWhisperModel}>Load Model</button>
               </div>
             </div>
@@ -510,7 +736,7 @@ export default function App() {
             <div className="empty-state">
               <Volume2 size={24} />
               <h1>Ready for local transcription</h1>
-              <p>Load a Whisper model, then start recording from the rail or the floating control.</p>
+              <p>Load a Whisper model, then start recording.</p>
             </div>
           )}
 
@@ -530,6 +756,19 @@ export default function App() {
                     aria-label="Meeting title"
                   />
                   <span>{new Date(activeMeeting.createdAt).toLocaleString()}</span>
+                  <div className="session-meta">
+                    <label>
+                      <span>Language</span>
+                      <select
+                        value={activeMeeting.language ?? 'en'}
+                        onChange={(event) => handleSessionLanguageChange(activeMeeting, event.target.value)}
+                      >
+                        {LANGUAGE_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
                 </div>
                 <div className="meeting-actions">
                   <button onClick={() => handleTogglePlayback(activeMeeting)} disabled={!activeMeeting.hasAudio} title={playingMeetingId === activeMeeting.id && !playbackPaused ? 'Pause recording playback' : 'Play recording'}>
@@ -550,7 +789,7 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="transcript-list" aria-live="polite">
+              <div className="transcript-list" ref={transcriptListRef} aria-live="polite">
                 {activeMeeting.transcript.map((segment) => (
                   <article
                     key={segment.id}
@@ -588,13 +827,31 @@ export default function App() {
             onStart={handleStartRecording}
             onStop={handleStopRecording}
           />
-          <div className="meter" aria-hidden="true">
-            <span />
-            <span />
-            <span />
-          </div>
         </div>
       </main>
+
+      {pendingMeetingId && (
+        <div className="modal-backdrop" role="presentation" onClick={handleCancelSwitch}>
+          <div
+            className="modal-card"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="switch-warning-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h2 id="switch-warning-title">Stop current recording?</h2>
+            <p>A recording is still in progress. Switching to another session will stop and save the current recording.</p>
+            <div className="modal-actions">
+              <button type="button" className="modal-secondary" onClick={handleCancelSwitch}>
+                Keep recording
+              </button>
+              <button type="button" className="modal-danger" onClick={handleConfirmSwitch}>
+                Stop &amp; switch
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
