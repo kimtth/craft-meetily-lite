@@ -1,1 +1,1 @@
-{"main":{"identifier":"main","description":"Main window capability for Meetly Light","local":true,"windows":["main"],"permissions":["core:default","core:event:default","core:window:default","core:app:default","dialog:default"]}}
+{"main":{"identifier":"main","description":"Main window capability for Meetly Lite","local":true,"windows":["main"],"permissions":["core:default","core:event:default","core:window:default","core:app:default","dialog:default"]}}

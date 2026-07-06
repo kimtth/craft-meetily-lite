@@ -1,23 +1,27 @@
 ---
-title: Meetly Light
-description: Lightweight Windows-first local meeting transcription app
+title: Meetly Lite
+description: Windows-first local meeting transcription app
 ---
 
-# Meetly Light
+## Meetly Lite
 
-Meetly Light is a Windows-first, local-first meeting transcription app generated at the repository root. The reference implementation in `ref-meetily/` is used only for architecture and product guidance.
+Meetly Lite is a Windows-first, local-first meeting transcription app generated at the repository root.
 
 ## Current Features
 
 * Compact side-panel transcription UI
 * Rust/Tauri recording control flow
 * Local Whisper model loading through the Rust core
-* Microphone capture through `cpal`
+* Selectable microphone input capture through `cpal`
+* Simultaneous microphone and system audio capture with mixed recording output
+* Capture modes for microphone only, system audio only, or microphone plus system audio
+* Per-session Whisper transcription language selection
 * Transcript segments emitted from Rust to the UI through Tauri events
 * Local meeting and transcript history stored under the app data directory
 * Transcript export as `.txt`
 * Recorded audio export as `.wav`
 * Recorded audio playback with per-transcript-segment navigation
+* Optional build-time Whisper acceleration for CUDA, Vulkan, or OpenBLAS
 * No AI summary workflow
 
 ## Development
@@ -63,11 +67,48 @@ npm install
 npm run tauri:build
 ```
 
-The build creates these files:
+Build with automatic Whisper acceleration detection:
+
+```powershell
+npm run tauri:build:gpu
+```
+
+Build with a specific Whisper backend:
+
+```powershell
+npm run tauri:build:cuda
+npm run tauri:build:vulkan
+npm run tauri:build:openblas
+```
+
+GPU acceleration is selected at build time. It is not a runtime setting in the app.
+Use `cuda` for NVIDIA GPUs with CUDA Toolkit installed, `vulkan` for supported
+GPU drivers with Vulkan tooling, and `openblas` for optimized CPU math when
+`BLAS_INCLUDE_DIRS` is configured. You can also set `TAURI_GPU_FEATURE` to
+`cuda`, `vulkan`, or `openblas` before running `npm run tauri:build:gpu`.
+GPU builds use a short Cargo target directory at the drive root, `D:\mtg`, and
+prefer the Ninja CMake generator bundled with Visual Studio Build Tools to avoid
+Windows path-length and MSBuild FileTracker failures in generated Whisper/Vulkan
+CMake files.
+
+The default `npm run tauri:build` creates these files:
 
 * `src-tauri/target/release/meetly-lite.exe`
-* `src-tauri/target/release/bundle/nsis/Meetly Light_0.1.0_x64-setup.exe`
-* `src-tauri/target/release/bundle/msi/Meetly Light_0.1.0_x64_en-US.msi`
+* `src-tauri/target/release/bundle/nsis/Meetly Lite_0.1.0_x64-setup.exe`
+* `src-tauri/target/release/bundle/msi/Meetly Lite_0.1.0_x64_en-US.msi`
+
+GPU builds (`tauri:build:gpu`, `tauri:build:cuda`, `tauri:build:vulkan`, and
+`tauri:build:openblas`) redirect the Cargo target directory to `D:\mtg`, so their
+output lands here instead:
+
+* `D:\mtg\release\meetly-lite.exe`
+* `D:\mtg\release\bundle\nsis\Meetly Lite_0.1.0_x64-setup.exe`
+* `D:\mtg\release\bundle\msi\Meetly Lite_0.1.0_x64_en-US.msi`
+
+Install or run a GPU build from `D:\mtg`. GPU builds never update the
+`src-tauri/target/release` files, so those paths keep stale code from an earlier
+default build. Running the old `src-tauri/target/release/meetly-lite.exe` after a
+GPU build is the most common cause of "my changes did not take effect."
 
 Use the installer for normal testing. Running the raw `meetly-lite.exe` also
 works, but it does not install shortcuts or app metadata.
@@ -117,7 +158,8 @@ shown in File Explorer.
 3. Select `Browse` next to `Whisper Model Path`.
 4. Choose the downloaded `ggml-*.bin` model file.
 5. Select `Load Model`.
-6. Start recording from the microphone button.
+6. Choose the capture mode, microphone input, system audio output, and session language.
+7. Start recording from the microphone button.
 
 Do not use `npm run dev` to test model loading. The browser-only Vite preview
 cannot call Tauri native commands and cannot load Whisper models.
@@ -128,12 +170,15 @@ cannot call Tauri native commands and cannot load Whisper models.
 The root Tauri backend provides these commands to the frontend:
 
 * `get_meetings`
+* `list_audio_input_devices`
+* `list_audio_output_devices`
 * `load_whisper_model`
 * `select_whisper_model`
 * `get_whisper_model_status`
 * `start_recording`
 * `stop_recording`
 * `rename_meeting`
+* `update_meeting_language`
 * `delete_meeting`
 * `export_transcript`
 * `export_audio`

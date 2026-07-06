@@ -6,8 +6,14 @@ edition = "2021"
 rust-version = "1.77"
 
 [lib]
-name = "meetly_light_lib"
+name = "meetly_lite_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+cuda = ["whisper-rs/cuda"]
+vulkan = ["whisper-rs/vulkan"]
+openblas = ["whisper-rs/openblas"]
 
 [build-dependencies]
 tauri-build = { version = "2.3.0", features = [] }
