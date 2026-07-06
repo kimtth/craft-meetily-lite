@@ -1,0 +1,28 @@
+{
+  "name": "meetly-lite",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 3118 --strictPort",
+    "tauri": "tauri",
+    "tauri:dev": "call \"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat\" && set \"LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin\" && set \"PATH=C:\\Program Files\\CMake\\bin;C:\\Program Files\\LLVM\\bin;%PATH%\" && tauri dev",
+    "tauri:build": "call \"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat\" && set \"LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin\" && set \"PATH=C:\\Program Files\\CMake\\bin;C:\\Program Files\\LLVM\\bin;%PATH%\" && tauri build",
+    "build": "tsc && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4118"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "latest",
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "typescript": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "lucide-react": "latest"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest"
+  }
+}
