@@ -1,11 +1,6 @@
----
-title: Meetly Light Architecture
-description: Architecture notes for the lightweight Windows-first Meetly implementation
----
+## Meetly Lite Architecture
 
-# Meetly Light Architecture
-
-Meetly Light is generated at the workspace root. The reference project in `ref-meetily/` is read-only input and must not be modified.
+Meetly Lite is generated at the workspace root. The reference project in `ref-meetily/` is read-only input and must not be modified.
 
 ## Current Implementation Slice
 
@@ -30,7 +25,7 @@ Node.js file-store backend was removed because it did not perform native audio
 capture or transcription.
 
 ```mermaid
-flowchart LR
+flowchart TD
 	UI[React side-panel UI]
 	Tauri[Tauri command bridge]
 	Rust[Rust backend core]
@@ -61,7 +56,7 @@ loading a local Whisper model file.
 ## Native Runtime Flow
 
 ```mermaid
-flowchart LR
+flowchart TD
 	UI[React side-panel UI]
 	Model[Load Whisper model path]
 	Record[Start recording command]

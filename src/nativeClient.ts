@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { Meeting, TranscriptSegment } from './types';
+import type { AudioInputDevice, AudioOutputDevice, Meeting, RecordingOptions, TranscriptSegment, WhisperModelStatus } from './types';
 
 const FALLBACK_MEETINGS_KEY = 'meetly-lite:fallback-meetings';
 
@@ -33,11 +33,31 @@ export async function fetchMeetings(): Promise<Meeting[]> {
   return invoke<Meeting[]>('get_meetings');
 }
 
-export async function startNativeRecording(meetingTitle?: string): Promise<Meeting> {
+export async function listNativeAudioInputDevices(): Promise<AudioInputDevice[]> {
+  if (!hasTauriRuntime()) {
+    return [{ id: '', name: 'System default', isDefault: true }];
+  }
+  return invoke<AudioInputDevice[]>('list_audio_input_devices');
+}
+
+export async function listNativeAudioOutputDevices(): Promise<AudioOutputDevice[]> {
+  if (!hasTauriRuntime()) {
+    return [{ id: '', name: 'System default', isDefault: true }];
+  }
+  return invoke<AudioOutputDevice[]>('list_audio_output_devices');
+}
+
+export async function startNativeRecording(options: RecordingOptions = {}): Promise<Meeting> {
   if (!hasTauriRuntime()) {
     return requireTauriRuntime('Recording');
   }
-  return invoke<Meeting>('start_recording', { meetingTitle });
+  return invoke<Meeting>('start_recording', {
+    meetingTitle: options.meetingTitle,
+    audioDeviceId: options.audioDeviceId,
+    systemAudioDeviceId: options.systemAudioDeviceId,
+    captureMode: options.captureMode,
+    language: options.language,
+  });
 }
 
 export async function stopNativeRecording(): Promise<Meeting> {
@@ -68,6 +88,20 @@ export async function renameNativeMeeting(meetingId: string, title: string): Pro
     return meeting;
   }
   return invoke<Meeting>('rename_meeting', { meetingId, title });
+}
+
+export async function updateNativeMeetingLanguage(meetingId: string, language: string): Promise<Meeting> {
+  if (!hasTauriRuntime()) {
+    const meetings = readFallbackJson<Meeting[]>(FALLBACK_MEETINGS_KEY, []);
+    const updated = meetings.map((meeting) => meeting.id === meetingId ? { ...meeting, language } : meeting);
+    localStorage.setItem(FALLBACK_MEETINGS_KEY, JSON.stringify(updated));
+    const meeting = updated.find((item) => item.id === meetingId);
+    if (!meeting) {
+      throw new Error('Meeting not found');
+    }
+    return meeting;
+  }
+  return invoke<Meeting>('update_meeting_language', { meetingId, language });
 }
 
 export async function exportNativeTranscript(meetingId: string): Promise<string | null> {
@@ -112,11 +146,11 @@ export async function resumeNativePlayback(): Promise<void> {
   return invoke<void>('resume_playback');
 }
 
-export async function getWhisperModelStatus(): Promise<string> {
+export async function getWhisperModelStatus(): Promise<WhisperModelStatus> {
   if (!hasTauriRuntime()) {
-    return 'desktop app required';
+    return { loaded: false, path: null };
   }
-  return invoke<string>('get_whisper_model_status');
+  return invoke<WhisperModelStatus>('get_whisper_model_status');
 }
 
 export async function loadWhisperModel(modelPath: string): Promise<void> {
