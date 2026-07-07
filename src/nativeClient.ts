@@ -1,8 +1,9 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { AudioInputDevice, AudioOutputDevice, Meeting, RecordingOptions, TranscriptSegment, WhisperModelStatus } from './types';
+import type { AudioInputDevice, AudioOutputDevice, AppSettings, Meeting, RecordingOptions, TranscriptSegment, WhisperModelStatus } from './types';
 
 const FALLBACK_MEETINGS_KEY = 'meetly-lite:fallback-meetings';
+const FALLBACK_SETTINGS_KEY = 'meetly-lite:settings';
 
 function hasTauriRuntime(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -26,11 +27,48 @@ export type NativeTranscriptEvent = {
   segment: TranscriptSegment;
 };
 
+export type NativeAudioChunkEvent = {
+  meetingId: string;
+  offsetSeconds: number;
+  pcmBase64: string;
+};
+
+export type AzureCliAccessToken = {
+  token: string;
+  expiresOnTimestamp: number;
+};
+
+export type AzureCliStatus = {
+  id: string;
+  state: 'connected' | 'unconfigured' | 'error';
+  detail: string;
+  account?: string | null;
+};
+
 export async function fetchMeetings(): Promise<Meeting[]> {
   if (!hasTauriRuntime()) {
     return readFallbackJson<Meeting[]>(FALLBACK_MEETINGS_KEY, []);
   }
   return invoke<Meeting[]>('get_meetings');
+}
+
+export async function getNativeSettings(): Promise<AppSettings | null> {
+  if (!hasTauriRuntime()) {
+    return readFallbackJson<AppSettings | null>(FALLBACK_SETTINGS_KEY, null);
+  }
+  return invoke<AppSettings>('get_settings');
+}
+
+export async function saveNativeSettings(settings: AppSettings): Promise<void> {
+  if (!hasTauriRuntime()) {
+    try {
+      localStorage.setItem(FALLBACK_SETTINGS_KEY, JSON.stringify(settings));
+    } catch {
+      // Ignore storage quota or serialization errors in the browser preview.
+    }
+    return;
+  }
+  return invoke<void>('save_settings', { settings });
 }
 
 export async function listNativeAudioInputDevices(): Promise<AudioInputDevice[]> {
@@ -57,7 +95,36 @@ export async function startNativeRecording(options: RecordingOptions = {}): Prom
     systemAudioDeviceId: options.systemAudioDeviceId,
     captureMode: options.captureMode,
     language: options.language,
+    transcriptionEngine: options.transcriptionEngine,
   });
+}
+
+export async function addNativeTranscriptSegment(meetingId: string, text: string, offsetSeconds: number): Promise<TranscriptSegment> {
+  if (!hasTauriRuntime()) {
+    return requireTauriRuntime('Transcript persistence');
+  }
+  return invoke<TranscriptSegment>('add_transcript_segment', { meetingId, text, offsetSeconds });
+}
+
+export async function getAzureCliAccessToken(tenantId?: string, subscriptionId?: string): Promise<AzureCliAccessToken> {
+  if (!hasTauriRuntime()) {
+    return requireTauriRuntime('Azure CLI authentication');
+  }
+  return invoke<AzureCliAccessToken>('get_azure_cli_access_token', { tenantId, subscriptionId });
+}
+
+export async function signInAzureCli(tenantId?: string, subscriptionId?: string): Promise<AzureCliStatus> {
+  if (!hasTauriRuntime()) {
+    return requireTauriRuntime('Azure CLI sign-in');
+  }
+  return invoke<AzureCliStatus>('sign_in_azure_cli', { tenantId, subscriptionId });
+}
+
+export async function checkAzureCliSignIn(tenantId?: string, subscriptionId?: string): Promise<AzureCliStatus> {
+  if (!hasTauriRuntime()) {
+    return { id: 'azure', state: 'unconfigured', detail: 'Azure CLI authentication requires the Tauri desktop app.' };
+  }
+  return invoke<AzureCliStatus>('check_azure_cli_sign_in', { tenantId, subscriptionId });
 }
 
 export async function stopNativeRecording(): Promise<Meeting> {
@@ -180,4 +247,12 @@ export function onTranscriptSegment(callback: (event: NativeTranscriptEvent) => 
     return Promise.resolve(() => undefined);
   }
   return listen<NativeTranscriptEvent>('transcript-segment', (event) => callback(event.payload));
+}
+
+export function onAudioChunk(callback: (event: NativeAudioChunkEvent) => void): Promise<() => void> {
+  if (!hasTauriRuntime()) {
+    void callback;
+    return Promise.resolve(() => undefined);
+  }
+  return listen<NativeAudioChunkEvent>('audio-chunk', (event) => callback(event.payload));
 }

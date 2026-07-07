@@ -16,16 +16,20 @@ import {
   Trash2,
   Volume2,
 } from 'lucide-react';
-import type { Meeting, RecorderStatus, TranscriptSegment } from './types';
+import type { Meeting, RecorderStatus, TranscriptSegment, TranscriptionEngine } from './types';
 import {
+  addNativeTranscriptSegment,
+  checkAzureCliSignIn,
   fetchMeetings,
   deleteNativeMeeting,
   exportNativeAudio,
   exportNativeTranscript,
+  getNativeSettings,
   getWhisperModelStatus,
   listNativeAudioInputDevices,
   listNativeAudioOutputDevices,
   loadWhisperModel,
+  onAudioChunk,
   onTranscriptSegment,
   openNativeMeetingFolder,
   pauseNativePlayback,
@@ -33,11 +37,16 @@ import {
   renameNativeMeeting,
   resumeNativePlayback,
   selectWhisperModel,
+  signInAzureCli,
+  saveNativeSettings,
   startNativeRecording,
   stopNativeRecording,
   setNativeMiniMode,
   updateNativeMeetingLanguage,
 } from './nativeClient';
+import { startAzureSpeechSession } from './azureSpeech';
+import type { AzureSpeechSession } from './azureSpeech';
+import type { AzureCliStatus } from './nativeClient';
 import { formatTimestamp } from './exporters';
 
 const LANGUAGE_OPTIONS = [
@@ -51,6 +60,16 @@ const LANGUAGE_OPTIONS = [
   { value: 'de', label: 'German' },
 ];
 
+const AZURE_LANGUAGE_OPTIONS = [
+  { value: 'en-US', label: 'English' },
+  { value: 'ko-KR', label: 'Korean' },
+  { value: 'ja-JP', label: 'Japanese' },
+  { value: 'zh-CN', label: 'Chinese' },
+  { value: 'es-ES', label: 'Spanish' },
+  { value: 'fr-FR', label: 'French' },
+  { value: 'de-DE', label: 'German' },
+];
+
 const STOP_RECORDING_TIMEOUT_MS = 10_000;
 
 const CAPTURE_MODE_OPTIONS = [
@@ -58,10 +77,6 @@ const CAPTURE_MODE_OPTIONS = [
   { value: 'microphone', label: 'Microphone only' },
   { value: 'system', label: 'System audio only' },
 ];
-
-function getLanguageLabel(language: string): string {
-  return LANGUAGE_OPTIONS.find((option) => option.value === language)?.label ?? language.toUpperCase();
-}
 
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error) {
@@ -120,14 +135,15 @@ type RecordButtonProps = {
 
 function RecordButton({ className, status, iconSize, onStart, onStop, title }: RecordButtonProps) {
   const isIdle = status === 'idle';
+  const isBusy = status === 'starting' || status === 'saving';
   return (
     <button
       className={className}
       title={title}
       onClick={isIdle ? onStart : onStop}
-      disabled={status === 'saving'}
+      disabled={isBusy}
     >
-      {isIdle ? <Mic size={iconSize} /> : <CircleStop size={iconSize} />}
+      {status === 'recording' || status === 'saving' ? <CircleStop size={iconSize} /> : <Mic size={iconSize} />}
     </button>
   );
 }
@@ -154,11 +170,22 @@ export default function App() {
   const [selectedSystemAudioOutputId, setSelectedSystemAudioOutputId] = useState('');
   const [selectedCaptureMode, setSelectedCaptureMode] = useState('microphoneSystem');
   const [selectedLanguage, setSelectedLanguage] = useState('en');
+  const [transcriptionEngine, setTranscriptionEngine] = useState<TranscriptionEngine>('local');
+  const [azureEndpoint, setAzureEndpoint] = useState('');
+  const [azureTenantId, setAzureTenantId] = useState('');
+  const [azureSubscriptionId, setAzureSubscriptionId] = useState('');
+  const [azureLanguage, setAzureLanguage] = useState('en-US');
+  const [azureCliStatus, setAzureCliStatus] = useState<AzureCliStatus | null>(null);
+  const [azureSigningIn, setAzureSigningIn] = useState(false);
+  const [azurePartialText, setAzurePartialText] = useState('');
 
   const elapsedTimerRef = useRef<number | null>(null);
   const activeMeetingIdRef = useRef<string | null>(null);
   const elapsedSecondsRef = useRef(0);
   const transcriptListRef = useRef<HTMLDivElement | null>(null);
+  const azureSessionRef = useRef<AzureSpeechSession | null>(null);
+  const audioChunkCleanupRef = useRef<(() => void) | null>(null);
+  const settingsLoadedRef = useRef(false);
 
   const activeMeeting = useMemo(
     () => meetings.find((meeting) => meeting.id === activeMeetingId) ?? null,
@@ -185,6 +212,26 @@ export default function App() {
       try {
         const storedMeetings = await fetchMeetings();
         setMeetings(storedMeetings);
+        const storedSettings = await getNativeSettings();
+        if (storedSettings) {
+          if (storedSettings.transcriptionEngine === 'local' || storedSettings.transcriptionEngine === 'azure') {
+            setTranscriptionEngine(storedSettings.transcriptionEngine);
+          }
+          if (storedSettings.captureMode) setSelectedCaptureMode(storedSettings.captureMode);
+          if (storedSettings.audioDeviceId) setSelectedAudioInputId(storedSettings.audioDeviceId);
+          if (storedSettings.systemAudioDeviceId) setSelectedSystemAudioOutputId(storedSettings.systemAudioDeviceId);
+          if (storedSettings.language) setSelectedLanguage(storedSettings.language);
+          if (storedSettings.azureEndpoint) setAzureEndpoint(storedSettings.azureEndpoint);
+          if (storedSettings.azureTenantId) setAzureTenantId(storedSettings.azureTenantId);
+          if (storedSettings.azureSubscriptionId) setAzureSubscriptionId(storedSettings.azureSubscriptionId);
+          if (storedSettings.azureLanguage) setAzureLanguage(storedSettings.azureLanguage);
+        }
+        void checkAzureCliSignIn(
+          storedSettings?.azureTenantId?.trim() || undefined,
+          storedSettings?.azureSubscriptionId?.trim() || undefined,
+        )
+          .then((status) => setAzureCliStatus(status))
+          .catch(() => undefined);
         const modelStatus = await getWhisperModelStatus();
         setWhisperModelLoaded(modelStatus.loaded);
         if (modelStatus.path) {
@@ -199,6 +246,8 @@ export default function App() {
         setAudioOutputDevices(outputDevices.length > 0 ? outputDevices : [{ id: '', name: 'System default', isDefault: true }]);
       } catch (loadError) {
         setError(loadError instanceof Error ? loadError.message : 'Tauri backend is not available.');
+      } finally {
+        settingsLoadedRef.current = true;
       }
     };
 
@@ -230,6 +279,40 @@ export default function App() {
     activeMeetingIdRef.current = activeMeetingId;
   }, [activeMeetingId]);
 
+  // Persist settings whenever they change. Debounced so per-keystroke edits in
+  // the Azure fields do not rewrite the store on every character. Skipped until
+  // the initial load has applied any stored values, so defaults never clobber
+  // saved settings on startup.
+  useEffect(() => {
+    if (!settingsLoadedRef.current) {
+      return;
+    }
+    const handle = window.setTimeout(() => {
+      void saveNativeSettings({
+        transcriptionEngine,
+        captureMode: selectedCaptureMode,
+        audioDeviceId: selectedAudioInputId,
+        systemAudioDeviceId: selectedSystemAudioOutputId,
+        language: selectedLanguage,
+        azureEndpoint,
+        azureTenantId,
+        azureSubscriptionId,
+        azureLanguage,
+      }).catch(() => undefined);
+    }, 400);
+    return () => window.clearTimeout(handle);
+  }, [
+    transcriptionEngine,
+    selectedCaptureMode,
+    selectedAudioInputId,
+    selectedSystemAudioOutputId,
+    selectedLanguage,
+    azureEndpoint,
+    azureTenantId,
+    azureSubscriptionId,
+    azureLanguage,
+  ]);
+
   useEffect(() => {
     const element = transcriptListRef.current;
     if (element) {
@@ -242,6 +325,8 @@ export default function App() {
       if (elapsedTimerRef.current) {
         window.clearInterval(elapsedTimerRef.current);
       }
+      audioChunkCleanupRef.current?.();
+      void azureSessionRef.current?.stop();
     };
   }, []);
 
@@ -282,6 +367,37 @@ export default function App() {
     }
   };
 
+  const tenantForAzureCli = () => azureTenantId.trim() || undefined;
+  const subscriptionForAzureCli = () => azureSubscriptionId.trim() || undefined;
+
+  const handleAzureSignIn = async () => {
+    setError(null);
+    setAzureSigningIn(true);
+    try {
+      const status = await signInAzureCli(tenantForAzureCli(), subscriptionForAzureCli());
+      setAzureCliStatus(status);
+      if (status.state === 'error') {
+        setError(status.detail);
+        return false;
+      }
+      return true;
+    } catch (authError) {
+      setError(getErrorMessage(authError, 'Azure CLI sign-in failed.'));
+      return false;
+    } finally {
+      setAzureSigningIn(false);
+    }
+  };
+
+  const ensureAzureCliSignedIn = async () => {
+    const status = await checkAzureCliSignIn(tenantForAzureCli(), subscriptionForAzureCli());
+    setAzureCliStatus(status);
+    if (status.state === 'connected') {
+      return true;
+    }
+    return handleAzureSignIn();
+  };
+
   const startTimers = () => {
     elapsedTimerRef.current = window.setInterval(() => {
       setElapsedSeconds((value) => {
@@ -306,30 +422,68 @@ export default function App() {
 
   const handleStartRecording = async () => {
     setError(null);
+    setStatus('starting');
     setShowRecordingList(false);
+    setAzurePartialText('');
+    let azureSession: AzureSpeechSession | null = null;
+    let audioChunkCleanup: (() => void) | null = null;
     try {
       // Trigger the same load path as the "Load Model" button so the Whisper
       // model is ready without a manual step. If no path is configured yet, ask
       // the backend for an auto-detected model. Loading here is best-effort: the
       // backend also auto-loads/detects a model when recording starts, so we do
       // not block on a frontend load failure.
-      let modelPath = whisperModelPath.trim();
-      if (!modelPath) {
-        const status = await getWhisperModelStatus();
-        if (status.path) {
-          modelPath = status.path;
-          setWhisperModelPath(status.path);
+      if (transcriptionEngine === 'local') {
+        let modelPath = whisperModelPath.trim();
+        if (!modelPath) {
+          const status = await getWhisperModelStatus();
+          if (status.path) {
+            modelPath = status.path;
+            setWhisperModelPath(status.path);
+          }
         }
-      }
-      if (modelPath) {
-        await ensureWhisperModelLoaded(modelPath, false);
+        if (modelPath) {
+          await ensureWhisperModelLoaded(modelPath, false);
+        }
+      } else {
+        const resolvedAzureEndpoint = azureEndpoint.trim();
+        if (!resolvedAzureEndpoint) {
+          throw new Error('Enter the Speech custom domain endpoint before recording with Azure.');
+        }
+        const signedIn = await ensureAzureCliSignedIn();
+        if (!signedIn) {
+          throw new Error('Azure CLI sign-in is required before recording with Azure Speech.');
+        }
+        azureSession = await startAzureSpeechSession({
+          endpoint: resolvedAzureEndpoint,
+          tenantId: tenantForAzureCli(),
+          subscriptionId: subscriptionForAzureCli(),
+          language: azureLanguage.trim() || 'en-US',
+          onPartialText: setAzurePartialText,
+          onFinalText: async (text, offsetSeconds) => {
+            const meetingId = activeMeetingIdRef.current;
+            if (meetingId) {
+              await addNativeTranscriptSegment(meetingId, text, offsetSeconds);
+              setAzurePartialText('');
+            }
+          },
+          onError: setError,
+        });
+        audioChunkCleanup = await onAudioChunk((event) => {
+          if (event.meetingId === activeMeetingIdRef.current) {
+            azureSession?.pushPcmBase64(event.pcmBase64);
+          }
+        });
       }
       const meeting = await startNativeRecording({
         audioDeviceId: selectedAudioInputId,
         systemAudioDeviceId: selectedSystemAudioOutputId,
         captureMode: selectedCaptureMode,
-        language: selectedLanguage,
+        language: transcriptionEngine === 'azure' ? azureLanguage.trim() || 'en-US' : selectedLanguage,
+        transcriptionEngine,
       });
+      azureSessionRef.current = azureSession;
+      audioChunkCleanupRef.current = audioChunkCleanup;
       setMeetings((current) => upsertMeeting(current, meeting));
       setActiveMeetingId(meeting.id);
       activeMeetingIdRef.current = meeting.id;
@@ -338,15 +492,20 @@ export default function App() {
       setStatus('recording');
       startTimers();
       // Reflect the model the backend actually loaded (e.g. an auto-detected one).
-      getWhisperModelStatus()
-        .then((status) => {
-          setWhisperModelLoaded(status.loaded);
-          if (status.path) {
-            setWhisperModelPath(status.path);
-          }
-        })
-        .catch(() => undefined);
+      if (transcriptionEngine === 'local') {
+        getWhisperModelStatus()
+          .then((status) => {
+            setWhisperModelLoaded(status.loaded);
+            if (status.path) {
+              setWhisperModelPath(status.path);
+            }
+          })
+          .catch(() => undefined);
+      }
     } catch (recordingError) {
+      audioChunkCleanup?.();
+      await azureSession?.stop();
+      setStatus('idle');
       setError(getErrorMessage(recordingError, 'Native recording could not start.'));
     }
   };
@@ -361,6 +520,11 @@ export default function App() {
           window.setTimeout(() => reject(new Error('Timed out while stopping recording.')), STOP_RECORDING_TIMEOUT_MS);
         }),
       ]);
+      audioChunkCleanupRef.current?.();
+      audioChunkCleanupRef.current = null;
+      await azureSessionRef.current?.stop();
+      azureSessionRef.current = null;
+      setAzurePartialText('');
       setMeetings((current) => upsertMeeting(current, meeting));
       setStatus('idle');
     } catch (stopError) {
@@ -555,13 +719,21 @@ export default function App() {
         </header>
 
         <main className="mini-transcript" ref={transcriptListRef} aria-live="polite">
-          {activeMeeting?.transcript.length ? (
-            activeMeeting.transcript.map((segment) => (
+          {activeMeeting?.transcript.length || azurePartialText ? (
+            <>
+            {activeMeeting?.transcript.map((segment) => (
               <div className="mini-transcript-row" key={segment.id}>
                 <span>{formatTimestamp(segment.offsetSeconds)}</span>
                 <p>{segment.text}</p>
               </div>
-            ))
+            ))}
+            {azurePartialText && (
+              <div className="mini-transcript-row pending">
+                <span>live</span>
+                <p>{azurePartialText}</p>
+              </div>
+            )}
+            </>
           ) : (
             <div className="mini-transcript-empty">
               <MessageSquareText size={15} />
@@ -642,13 +814,24 @@ export default function App() {
             <div className="settings-intro">
               <span className="section-kicker">Meetly Lite</span>
               <h2>Settings</h2>
-              <p>Local transcription runs in the Rust backend. Configure the model before recording.</p>
+              <p>Choose the capture source, transcription engine, and language for new recordings.</p>
             </div>
             <div className="settings-card primary">
               <div>
                 <h3>Session Defaults</h3>
-                <p>Choose the input and language used when the next recording starts.</p>
+                <p>These settings apply when the next recording starts.</p>
               </div>
+              <label>
+                Transcription Engine
+                <select
+                  value={transcriptionEngine}
+                  onChange={(event) => setTranscriptionEngine(event.target.value as TranscriptionEngine)}
+                  disabled={status !== 'idle'}
+                >
+                  <option value="local">Local Whisper</option>
+                  <option value="azure">Azure Speech</option>
+                </select>
+              </label>
               <label>
                 Capture Mode
                 <select
@@ -695,39 +878,91 @@ export default function App() {
               <label>
                 Session Language
                 <select
-                  value={selectedLanguage}
-                  onChange={(event) => setSelectedLanguage(event.target.value)}
+                  value={transcriptionEngine === 'azure' ? azureLanguage : selectedLanguage}
+                  onChange={(event) => {
+                    if (transcriptionEngine === 'azure') {
+                      setAzureLanguage(event.target.value === 'auto' ? 'en-US' : event.target.value);
+                    } else {
+                      setSelectedLanguage(event.target.value);
+                    }
+                  }}
                   disabled={status !== 'idle'}
                 >
-                  {LANGUAGE_OPTIONS.map((option) => (
+                  {(transcriptionEngine === 'azure' ? AZURE_LANGUAGE_OPTIONS : LANGUAGE_OPTIONS).map((option) => (
                     <option key={option.value} value={option.value}>{option.label}</option>
                   ))}
                 </select>
               </label>
             </div>
-            <div className="settings-card primary">
-              <div>
-                <h3>Transcription Model</h3>
-                <p>Connect a local speech-to-text model used by the Rust backend.</p>
-              </div>
-              <label>
-                Whisper Model Path
-                <div className="path-picker-row">
-                  <input
-                    value={whisperModelPath}
-                    onChange={(event) => setWhisperModelPath(event.target.value)}
-                    placeholder="C:\\models\\ggml-base.en.bin"
-                  />
-                  <button type="button" onClick={handleBrowseWhisperModel}>Browse</button>
+            {transcriptionEngine === 'azure' && (
+              <div className="settings-card primary">
+                <div>
+                  <h3>Azure Speech</h3>
+                  <p>Use Azure Speech with Azure CLI sign-in for real-time recognition.</p>
                 </div>
-              </label>
-              <div className="settings-action-row">
-                <span className={`model-status ${whisperModelLoaded ? 'loaded' : ''}`}>
-                  {whisperModelLoaded ? 'loaded' : whisperModelPath ? 'not loaded' : 'missing'}
-                </span>
-                <button type="button" onClick={handleLoadWhisperModel}>Load Model</button>
+                <label>
+                  Speech Custom Domain Endpoint
+                  <input
+                    value={azureEndpoint}
+                    onChange={(event) => setAzureEndpoint(event.target.value)}
+                    placeholder="https://your-custom-name.cognitiveservices.azure.com/"
+                    disabled={status !== 'idle'}
+                  />
+                </label>
+                <label>
+                  Azure CLI Tenant ID
+                  <input
+                    value={azureTenantId}
+                    onChange={(event) => setAzureTenantId(event.target.value)}
+                    placeholder="Optional tenant GUID for Azure CLI sign-in"
+                    disabled={status !== 'idle'}
+                  />
+                </label>
+                <label>
+                  Azure CLI Subscription ID
+                  <input
+                    value={azureSubscriptionId}
+                    onChange={(event) => setAzureSubscriptionId(event.target.value)}
+                    placeholder="Optional subscription GUID for Azure CLI account selection"
+                    disabled={status !== 'idle'}
+                  />
+                </label>
+                <div className="settings-action-row">
+                  <span className={`model-status ${azureCliStatus?.state === 'connected' ? 'loaded' : ''}`}>
+                    {azureCliStatus?.state === 'connected' ? 'Signed in' : 'Not signed in'}
+                  </span>
+                  <button type="button" onClick={handleAzureSignIn} disabled={status !== 'idle' || azureSigningIn}>
+                    {azureSigningIn ? 'Signing in...' : 'Sign in'}
+                  </button>
+                </div>
+                {azureCliStatus?.detail && <p>{azureCliStatus.detail}</p>}
               </div>
-            </div>
+            )}
+            {transcriptionEngine === 'local' && (
+              <div className="settings-card primary">
+                <div>
+                  <h3>Transcription Model</h3>
+                  <p>Use a local ggml Whisper model. If the path is blank, Meetly tries known model folders when recording starts.</p>
+                </div>
+                <label>
+                  Whisper Model Path
+                  <div className="path-picker-row">
+                    <input
+                      value={whisperModelPath}
+                      onChange={(event) => setWhisperModelPath(event.target.value)}
+                      placeholder="C:\\models\\ggml-base.en.bin"
+                    />
+                    <button type="button" onClick={handleBrowseWhisperModel}>Browse</button>
+                  </div>
+                </label>
+                <div className="settings-action-row">
+                  <span className={`model-status ${whisperModelLoaded ? 'loaded' : ''}`}>
+                    {whisperModelLoaded ? 'Loaded' : whisperModelPath ? 'Path selected' : 'Auto-detect'}
+                  </span>
+                  <button type="button" onClick={handleLoadWhisperModel}>Load selected model</button>
+                </div>
+              </div>
+            )}
           </aside>
         )}
 
@@ -735,8 +970,8 @@ export default function App() {
           {!activeMeeting && (
             <div className="empty-state">
               <Volume2 size={24} />
-              <h1>Ready for local transcription</h1>
-              <p>Load a Whisper model, then start recording.</p>
+              <h1>Ready to transcribe</h1>
+              <p>Start recording, or open Settings to choose a transcription engine.</p>
             </div>
           )}
 
@@ -809,7 +1044,13 @@ export default function App() {
                     <p>{segment.text}</p>
                   </article>
                 ))}
-                {activeMeeting.transcript.length === 0 && (
+                {azurePartialText && (
+                  <article className="transcript-row pending">
+                    <span className="segment-play">live</span>
+                    <p>{azurePartialText}</p>
+                  </article>
+                )}
+                {activeMeeting.transcript.length === 0 && !azurePartialText && (
                   <div className="empty-state small">
                     <p>Recording is ready. Transcript text will stream in as it is produced.</p>
                   </div>
