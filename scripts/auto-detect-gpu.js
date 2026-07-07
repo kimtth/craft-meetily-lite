@@ -37,13 +37,8 @@ function detectGpuFeature() {
     return 'vulkan';
   }
 
-  if (commandExists('vulkaninfo') || existsSync('C:\\VulkanSDK')) {
+  if (commandExists('vulkaninfo')) {
     log('Vulkan capability was detected, but VULKAN_SDK is not set.');
-  }
-
-  if (process.env.BLAS_INCLUDE_DIRS) {
-    log('OpenBLAS configuration detected. Using optimized CPU backend.');
-    return 'openblas';
   }
 
   log('No GPU acceleration backend detected. Using default CPU build.');

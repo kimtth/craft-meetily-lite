@@ -6,11 +6,11 @@ const command = process.argv[2];
 const forcedFeature = process.argv[3];
 
 if (!['dev', 'build'].includes(command)) {
-  process.stderr.write('Usage: node scripts/tauri-gpu.js <dev|build> [cuda|vulkan|openblas]\n');
+  process.stderr.write('Usage: node scripts/tauri-gpu.js <dev|build> [cuda|vulkan]\n');
   process.exit(1);
 }
 
-if (forcedFeature && !['cuda', 'vulkan', 'openblas'].includes(forcedFeature)) {
+if (forcedFeature && !['cuda', 'vulkan'].includes(forcedFeature)) {
   process.stderr.write(`Unsupported GPU feature: ${forcedFeature}\n`);
   process.exit(1);
 }
@@ -43,11 +43,13 @@ function findBundledNinja() {
     return '';
   }
 
+  const pf86 = process.env['ProgramFiles(x86)'];
+  const pf = process.env.ProgramFiles;
   const candidates = [
-    'C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\Ninja\\ninja.exe',
-    'C:\\Program Files\\Microsoft Visual Studio\\2022\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\Ninja\\ninja.exe',
-    'C:\\Program Files\\CMake\\bin\\ninja.exe',
-  ];
+    pf86 && path.join(pf86, 'Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe'),
+    pf && path.join(pf, 'Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe'),
+    pf && path.join(pf, 'CMake/bin/ninja.exe'),
+  ].filter(Boolean);
 
   return candidates.find((candidate) => existsSync(candidate)) ?? '';
 }

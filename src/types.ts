@@ -44,6 +44,21 @@ export type RecordingOptions = {
   systemAudioDeviceId?: string;
   captureMode?: string;
   language?: string;
+  transcriptionEngine?: TranscriptionEngine;
 };
 
-export type RecorderStatus = 'idle' | 'recording' | 'saving';
+export type RecorderStatus = 'idle' | 'starting' | 'recording' | 'saving';
+
+export type TranscriptionEngine = 'local' | 'azure';
+
+export type AppSettings = {
+  transcriptionEngine: string;
+  captureMode: string;
+  audioDeviceId: string;
+  systemAudioDeviceId: string;
+  language: string;
+  azureEndpoint: string;
+  azureTenantId: string;
+  azureSubscriptionId: string;
+  azureLanguage: string;
+};
