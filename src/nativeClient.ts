@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { AudioInputDevice, AudioOutputDevice, AppSettings, Meeting, RecordingOptions, TranscriptSegment, WhisperModelStatus } from './types';
+import type { AudioInputDevice, AudioOutputDevice, AppSettings, FastTranscriptionFile, FastTranscriptionProgress, Meeting, RecordingOptions, RecordingRuntimeStatus, ScreenAudioLevels, ScreenProcessingStatus, ScreenTarget, TranscriptSegment, VideoRecording, WhisperModelStatus } from './types';
 
 const FALLBACK_MEETINGS_KEY = 'meetly-lite:fallback-meetings';
 const FALLBACK_SETTINGS_KEY = 'meetly-lite:settings';
@@ -50,6 +50,13 @@ export async function fetchMeetings(): Promise<Meeting[]> {
     return readFallbackJson<Meeting[]>(FALLBACK_MEETINGS_KEY, []);
   }
   return invoke<Meeting[]>('get_meetings');
+}
+
+export async function refreshMeetings(): Promise<Meeting[]> {
+  if (!hasTauriRuntime()) {
+    return readFallbackJson<Meeting[]>(FALLBACK_MEETINGS_KEY, []);
+  }
+  return invoke<Meeting[]>('refresh_meetings');
 }
 
 export async function getNativeSettings(): Promise<AppSettings | null> {
@@ -255,4 +262,150 @@ export function onAudioChunk(callback: (event: NativeAudioChunkEvent) => void): 
     return Promise.resolve(() => undefined);
   }
   return listen<NativeAudioChunkEvent>('audio-chunk', (event) => callback(event.payload));
+}
+
+export async function selectFastTranscriptionAudio(): Promise<FastTranscriptionFile | null> {
+  if (!hasTauriRuntime()) {
+    return requireTauriRuntime('File transcription');
+  }
+  return invoke<FastTranscriptionFile | null>('select_fast_transcription_audio');
+}
+
+export async function transcribeFastAudio(
+  path: string,
+  title: string | undefined,
+  language: string,
+  endpoint: string,
+  tenantId?: string,
+  subscriptionId?: string,
+): Promise<Meeting> {
+  if (!hasTauriRuntime()) {
+    return requireTauriRuntime('File transcription');
+  }
+  return invoke<Meeting>('transcribe_fast_audio', {
+    path,
+    title,
+    language,
+    endpoint,
+    tenantId,
+    subscriptionId,
+  });
+}
+
+export function onFastTranscriptionProgress(callback: (progress: FastTranscriptionProgress) => void): Promise<() => void> {
+  if (!hasTauriRuntime()) {
+    void callback;
+    return Promise.resolve(() => undefined);
+  }
+  return listen<FastTranscriptionProgress>('fast-transcription-progress', (event) => callback(event.payload));
+}
+
+export async function fetchVideos(): Promise<VideoRecording[]> {
+  if (!hasTauriRuntime()) return [];
+  return invoke<VideoRecording[]>('get_videos');
+}
+
+export async function refreshVideos(): Promise<VideoRecording[]> {
+  if (!hasTauriRuntime()) return [];
+  return invoke<VideoRecording[]>('refresh_videos');
+}
+
+export async function listScreenTargets(): Promise<ScreenTarget[]> {
+  if (!hasTauriRuntime()) return [];
+  return invoke<ScreenTarget[]>('list_screen_targets');
+}
+
+export async function openAreaSelector(): Promise<void> {
+  if (!hasTauriRuntime()) return requireTauriRuntime('Area selection');
+  return invoke<void>('open_area_selector');
+}
+
+export async function completeAreaSelection(selection: {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  viewportWidth: number;
+  viewportHeight: number;
+}): Promise<void> {
+  if (!hasTauriRuntime()) return;
+  return invoke<void>('complete_area_selection', selection);
+}
+
+export async function cancelAreaSelection(): Promise<void> {
+  if (!hasTauriRuntime()) return;
+  return invoke<void>('cancel_area_selection');
+}
+
+export function onAreaSelected(callback: (target: ScreenTarget) => void): Promise<() => void> {
+  if (!hasTauriRuntime()) {
+    void callback;
+    return Promise.resolve(() => undefined);
+  }
+  return listen<ScreenTarget>('area-selected', (event) => callback(event.payload));
+}
+
+export async function selectVideoOutputFolder(): Promise<string | null> {
+  if (!hasTauriRuntime()) return requireTauriRuntime('Video output folder selection');
+  return invoke<string | null>('select_video_output_folder');
+}
+
+export async function selectFfmpegExecutable(): Promise<string | null> {
+  if (!hasTauriRuntime()) return requireTauriRuntime('FFmpeg executable selection');
+  return invoke<string | null>('select_ffmpeg_executable');
+}
+
+export async function openVideoRecordingsFolder(): Promise<void> {
+  if (!hasTauriRuntime()) return requireTauriRuntime('Open recordings folder');
+  return invoke<void>('open_video_recordings_folder');
+}
+
+export async function startScreenRecording(options: {
+  title?: string;
+  targetId: string;
+  targetName: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  codec: string;
+  audioDeviceId?: string;
+  systemAudioDeviceId?: string;
+  captureMode?: string;
+}): Promise<VideoRecording> {
+  if (!hasTauriRuntime()) return requireTauriRuntime('Screen recording');
+  return invoke<VideoRecording>('start_screen_recording', options);
+}
+
+export async function stopScreenRecording(): Promise<VideoRecording> {
+  if (!hasTauriRuntime()) return requireTauriRuntime('Screen recording');
+  return invoke<VideoRecording>('stop_screen_recording');
+}
+
+export function onScreenAudioLevel(callback: (levels: ScreenAudioLevels) => void): Promise<() => void> {
+  if (!hasTauriRuntime()) {
+    void callback;
+    return Promise.resolve(() => undefined);
+  }
+  return listen<ScreenAudioLevels>('screen-audio-level', (event) => callback(event.payload));
+}
+
+export function onScreenProcessingStatus(callback: (status: ScreenProcessingStatus) => void): Promise<() => void> {
+  if (!hasTauriRuntime()) {
+    void callback;
+    return Promise.resolve(() => undefined);
+  }
+  return listen<ScreenProcessingStatus>('screen-processing-status', (event) => callback(event.payload));
+}
+
+export async function getRecordingRuntimeStatus(): Promise<RecordingRuntimeStatus> {
+  if (!hasTauriRuntime()) {
+    return {
+      audioRecordingActive: false,
+      audioElapsedSeconds: 0,
+      screenRecordingActive: false,
+      screenElapsedSeconds: 0,
+    };
+  }
+  return invoke<RecordingRuntimeStatus>('get_recording_runtime_status');
 }

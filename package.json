@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 3118 --strictPort",
+    "prepare:ffmpeg": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-ffmpeg.ps1",
     "tauri": "tauri",
     "tauri:dev": "call \"%ProgramFiles(x86)%\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat\" && set \"LIBCLANG_PATH=%ProgramFiles%\\LLVM\\bin\" && set \"PATH=%ProgramFiles%\\CMake\\bin;%ProgramFiles%\\LLVM\\bin;%PATH%\" && tauri dev",
     "tauri:build": "call \"%ProgramFiles(x86)%\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat\" && set \"LIBCLANG_PATH=%ProgramFiles%\\LLVM\\bin\" && set \"PATH=%ProgramFiles%\\CMake\\bin;%ProgramFiles%\\LLVM\\bin;%PATH%\" && tauri build",

@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+use std::path::Path;
 use std::process::Command;
 
 /// Resource required to call Azure AI Speech (Cognitive Services) with a bearer token.
-const COGNITIVE_SERVICES_RESOURCE: &str = "https://cognitiveservices.azure.com/";
+pub(crate) const COGNITIVE_SERVICES_RESOURCE: &str = "https://cognitiveservices.azure.com/";
 /// Resource used only to confirm that a usable Azure CLI token can be issued.
 const CONFIRM_RESOURCE: &str = "https://management.azure.com/";
 
@@ -53,16 +54,36 @@ fn normalized_optional(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+pub(crate) fn validated_cli_identifier(
+    value: Option<String>,
+    label: &str,
+) -> Result<Option<String>, String> {
+    let value = normalized_optional(value);
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let is_safe = value.len() <= 253
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_')
+        });
+    if !is_safe {
+        return Err(format!(
+            "{label} contains unsupported characters. Use the Azure identifier, not a command or display name."
+        ));
+    }
+    Ok(Some(value))
+}
+
 /// Build `az account get-access-token` arguments. The Azure CLI rejects
 /// `--tenant` and `--subscription` together, so prefer tenant. The subscription
 /// is still honored after sign-in through `az account set`.
-fn access_token_args(
+pub(crate) fn access_token_args(
     resource: &str,
     tenant_id: Option<String>,
     subscription_id: Option<String>,
-) -> Vec<String> {
-    let tenant_id = normalized_optional(tenant_id);
-    let subscription_id = normalized_optional(subscription_id);
+) -> Result<Vec<String>, String> {
+    let tenant_id = validated_cli_identifier(tenant_id, "Tenant ID")?;
+    let subscription_id = validated_cli_identifier(subscription_id, "Subscription ID")?;
     let mut args = vec![
         "account".to_string(),
         "get-access-token".to_string(),
@@ -79,7 +100,7 @@ fn access_token_args(
         args.push("--subscription".to_string());
         args.push(subscription_id);
     }
-    args
+    Ok(args)
 }
 
 /// Build a `Command` that invokes the Azure CLI. On Windows the CLI ships as
@@ -92,6 +113,27 @@ fn az_command() -> Command {
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let mut command = Command::new("cmd");
+        // Desktop apps can inherit an outdated PATH when Azure CLI was
+        // installed after VS Code or the app started. Add the standard CLI
+        // install directories explicitly so `cmd /C az` can still resolve
+        // `az.cmd` without requiring a Windows sign-out or restart.
+        let cli_dirs = [
+            r"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin",
+            r"C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin",
+        ];
+        let mut paths: Vec<String> = cli_dirs
+            .iter()
+            .filter(|path| Path::new(path).join("az.cmd").is_file())
+            .map(|path| (*path).to_string())
+            .collect();
+        if let Some(current_path) = std::env::var_os("PATH") {
+            paths.extend(
+                std::env::split_paths(&current_path).map(|path| path.to_string_lossy().to_string()),
+            );
+        }
+        if !paths.is_empty() {
+            command.env("PATH", paths.join(";"));
+        }
         command.arg("/C").arg("az").creation_flags(CREATE_NO_WINDOW);
         command
     }
@@ -136,7 +178,7 @@ fn get_cli_access_token_blocking(
     tenant_id: Option<String>,
     subscription_id: Option<String>,
 ) -> Result<AzureCliAccessToken, String> {
-    let result = run_az_owned(access_token_args(resource, tenant_id, subscription_id));
+    let result = run_az_owned(access_token_args(resource, tenant_id, subscription_id)?);
     if result.code != 0 {
         let detail = result.stderr.trim();
         return Err(if detail.is_empty() {
@@ -255,8 +297,28 @@ fn sign_in_azure_cli_blocking(
     tenant_id: Option<String>,
     subscription_id: Option<String>,
 ) -> AzureCliStatus {
-    let tenant_id = normalized_optional(tenant_id);
-    let subscription_id = normalized_optional(subscription_id);
+    let tenant_id = match validated_cli_identifier(tenant_id, "Tenant ID") {
+        Ok(value) => value,
+        Err(detail) => {
+            return AzureCliStatus {
+                id: "azure".to_string(),
+                state: AzureCliState::Error,
+                detail,
+                account: None,
+            }
+        }
+    };
+    let subscription_id = match validated_cli_identifier(subscription_id, "Subscription ID") {
+        Ok(value) => value,
+        Err(detail) => {
+            return AzureCliStatus {
+                id: "azure".to_string(),
+                state: AzureCliState::Error,
+                detail,
+                account: None,
+            }
+        }
+    };
 
     // Best effort: clear cached CLI accounts so tenant/account switching shows
     // the browser account picker instead of silently reusing a stale identity.

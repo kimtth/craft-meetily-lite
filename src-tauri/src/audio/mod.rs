@@ -5,7 +5,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use rodio::{Decoder, OutputStream, Sink};
 use std::fs;
-use std::io::BufReader;
+use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,6 +15,8 @@ pub(crate) struct CaptureBuffers {
     pub(crate) microphone: Vec<f32>,
     pub(crate) system: Vec<f32>,
 }
+
+pub(crate) type IncrementalWavWriter = WavWriter<BufWriter<fs::File>>;
 
 #[derive(Clone, Copy)]
 enum AudioSource {
@@ -108,7 +110,7 @@ fn build_capture_stream(
     config: cpal::SupportedStreamConfig,
     source: AudioSource,
     samples: Arc<Mutex<CaptureBuffers>>,
-    pending: Arc<Mutex<CaptureBuffers>>,
+    pending: Option<Arc<Mutex<CaptureBuffers>>>,
 ) -> Result<cpal::Stream, String> {
     let sample_rate = config.sample_rate().0;
     let channels = config.channels();
@@ -121,7 +123,9 @@ fn build_capture_stream(
                 let mono = downmix_to_mono(data, channels);
                 let samples_16k = resample_to_16khz(&mono, sample_rate);
                 append_capture_samples(&samples, source, &samples_16k);
-                append_capture_samples(&pending, source, &samples_16k);
+                if let Some(pending) = pending.as_ref() {
+                    append_capture_samples(pending, source, &samples_16k);
+                }
             },
             error_callback,
             None,
@@ -133,7 +137,9 @@ fn build_capture_stream(
                 let mono = downmix_to_mono(&converted, channels);
                 let samples_16k = resample_to_16khz(&mono, sample_rate);
                 append_capture_samples(&samples, source, &samples_16k);
-                append_capture_samples(&pending, source, &samples_16k);
+                if let Some(pending) = pending.as_ref() {
+                    append_capture_samples(pending, source, &samples_16k);
+                }
             },
             error_callback,
             None,
@@ -145,7 +151,9 @@ fn build_capture_stream(
                 let mono = downmix_to_mono(&converted, channels);
                 let samples_16k = resample_to_16khz(&mono, sample_rate);
                 append_capture_samples(&samples, source, &samples_16k);
-                append_capture_samples(&pending, source, &samples_16k);
+                if let Some(pending) = pending.as_ref() {
+                    append_capture_samples(pending, source, &samples_16k);
+                }
             },
             error_callback,
             None,
@@ -286,7 +294,7 @@ pub(crate) fn build_capture_streams(
     system_audio_device_id: Option<&str>,
     capture_mode: &str,
     samples: Arc<Mutex<CaptureBuffers>>,
-    pending: Arc<Mutex<CaptureBuffers>>,
+    pending: Option<Arc<Mutex<CaptureBuffers>>>,
 ) -> Result<(Vec<cpal::Stream>, AudioSetup), String> {
     let host = audio_host();
     let mut streams = Vec::new();
@@ -350,19 +358,27 @@ pub(crate) fn build_capture_streams(
     Ok((streams, setup))
 }
 
-pub(crate) fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
+/// Opens a WAV destination before capture begins. Chunks are flushed during
+/// recording so an interrupted session retains the audio written so far.
+pub(crate) fn create_incremental_wav(
+    path: &Path,
+    sample_rate: u32,
+) -> Result<IncrementalWavWriter> {
     let spec = WavSpec {
         channels: 1,
         sample_rate,
         bits_per_sample: 16,
         sample_format: SampleFormat::Int,
     };
-    let mut writer = WavWriter::create(path, spec)?;
+    Ok(WavWriter::create(path, spec)?)
+}
+
+pub(crate) fn append_wav_chunk(writer: &mut IncrementalWavWriter, samples: &[f32]) -> Result<()> {
     for sample in samples {
         let value = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
         writer.write_sample(value)?;
     }
-    writer.finalize()?;
+    writer.flush()?;
     Ok(())
 }
 

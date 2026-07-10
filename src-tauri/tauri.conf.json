@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "com.meetly.lite",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run prepare:ffmpeg && npm run dev",
+    "beforeBuildCommand": "npm run prepare:ffmpeg && npm run build",
     "devUrl": "http://127.0.0.1:3118",
     "frontendDist": "../dist"
   },
@@ -13,9 +13,9 @@
     "windows": [
       {
         "title": "Meetly Lite",
-        "width": 760,
+        "width": 1040,
         "height": 760,
-        "minWidth": 640,
+        "minWidth": 960,
         "minHeight": 560,
         "resizable": true,
         "fullscreen": false,
@@ -31,6 +31,9 @@
   "bundle": {
     "active": true,
     "targets": ["nsis", "msi"],
-    "icon": ["icons/icon.ico"]
+    "icon": ["icons/icon.ico"],
+    "resources": {
+      "resources/": "resources/"
+    }
   }
 }
