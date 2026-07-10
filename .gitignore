@@ -80,3 +80,4 @@ frontend/src-tauri/binaries/
 ref-meetily/
 docs/image.png
 task-track.md
+/src-tauri/resources/ffmpeg.exe
