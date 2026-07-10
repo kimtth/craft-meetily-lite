@@ -1,28 +1,45 @@
 use crate::audio::{
-    build_capture_streams, list_input_devices, list_output_devices, mix_sources, pcm16_base64,
-    prepare_playback, stop_playback_session, write_wav, CaptureBuffers,
+    append_wav_chunk, build_capture_streams, create_incremental_wav, list_input_devices,
+    list_output_devices, mix_sources, pcm16_base64, prepare_playback, stop_playback_session,
+    CaptureBuffers,
 };
 use crate::azure_auth::{self, AzureCliAccessToken, AzureCliStatus};
+use crate::video::{self, ScreenTarget};
 use crate::{
     default_capture_mode, default_language, fallback_model_dirs, read_store, write_store,
     AppSettings, AppState, AudioChunkEvent, AudioInputDevice, AudioOutputDevice, Meeting,
-    PlaybackSession, RecorderSession, Store, TranscriptEvent, TranscriptSegment,
-    TranscriptionEngine, WhisperModelStatus,
+    PlaybackSession, RecorderSession, RecordingRuntimeStatus, ScreenAudioLevelEvent,
+    ScreenProcessingStatusEvent, ScreenRecorderSession, Store, TranscriptEvent, TranscriptSegment,
+    TranscriptionEngine, VideoRecording, WhisperModelStatus,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
+use rodio::{Decoder, Source};
 use std::fs;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, LogicalSize, Manager};
+use tauri::{
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, PhysicalSize, WebviewUrl,
+    WebviewWindowBuilder,
+};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
+pub(crate) mod meetings;
+pub(crate) mod screen;
+pub(crate) mod transcription;
+
 const TRANSCRIPT_CHUNK_SECONDS: u64 = 5;
 const TRANSCRIPT_SAMPLE_RATE: f64 = 16_000.0;
+const AUDIO_DEVICE_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+const AUDIO_THREAD_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+type ScreenAudioCaptureHandle = (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>);
+const FAST_TRANSCRIPTION_MAX_BYTES: u64 = 250 * 1024 * 1024;
+const FAST_TRANSCRIPTION_MAX_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
 
 fn now_string() -> String {
     Utc::now().to_rfc3339()
@@ -43,7 +60,7 @@ fn format_timestamp(seconds: f64) -> String {
     format!("{:02}:{:02}", total / 60, total % 60)
 }
 
-fn make_meeting(
+struct MeetingOptions {
     title: Option<String>,
     audio_device_id: Option<String>,
     audio_device_name: Option<String>,
@@ -51,11 +68,14 @@ fn make_meeting(
     system_audio_device_name: Option<String>,
     capture_mode: String,
     language: String,
-) -> Meeting {
+    transcription_engine: String,
+}
+
+fn make_meeting(options: MeetingOptions) -> Meeting {
     let now = now_string();
     Meeting {
         id: format!("meeting-{}", Uuid::new_v4()),
-        title: title.unwrap_or_else(|| {
+        title: options.title.unwrap_or_else(|| {
             format!("Meeting {}", chrono::Local::now().format("%Y-%m-%d %H-%M"))
         }),
         created_at: now.clone(),
@@ -64,12 +84,101 @@ fn make_meeting(
         transcript: Vec::new(),
         has_audio: false,
         recording_path: None,
-        audio_device_id,
-        audio_device_name,
-        system_audio_device_id,
-        system_audio_device_name,
-        capture_mode,
-        language,
+        audio_device_id: options.audio_device_id,
+        audio_device_name: options.audio_device_name,
+        system_audio_device_id: options.system_audio_device_id,
+        system_audio_device_name: options.system_audio_device_name,
+        capture_mode: options.capture_mode,
+        language: options.language,
+        transcription_engine: options.transcription_engine,
+    }
+}
+
+fn fast_transcription_file_details(path: &Path) -> Result<(String, u64, Duration), String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| "Choose a WAV, MP3, or MP4 file.".to_string())?;
+    if extension != "wav" && extension != "mp3" && extension != "mp4" {
+        return Err("Fast transcription supports WAV, MP3, and MP4 files only.".to_string());
+    }
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    if metadata.len() == 0 {
+        return Err("The selected audio file is empty.".to_string());
+    }
+    if metadata.len() > FAST_TRANSCRIPTION_MAX_BYTES {
+        return Err(
+            "The selected file exceeds the 250 MB Azure Speech Fast Transcription limit."
+                .to_string(),
+        );
+    }
+    let duration = if extension == "mp4" {
+        Duration::ZERO
+    } else {
+        let file = fs::File::open(path).map_err(|error| error.to_string())?;
+        Decoder::new(BufReader::new(file))
+            .map_err(|error| format!("Could not read the selected audio file: {error}"))?
+            .total_duration()
+            .ok_or_else(|| "Could not determine the selected audio duration.".to_string())?
+    };
+    if duration > FAST_TRANSCRIPTION_MAX_DURATION {
+        return Err(
+            "The selected audio is longer than the 2 hour Azure Speech Fast Transcription limit."
+                .to_string(),
+        );
+    }
+    Ok((extension, metadata.len(), duration))
+}
+
+pub(crate) fn fast_transcription_endpoint(endpoint: &str) -> Result<reqwest::Url, String> {
+    const AZURE_COGNITIVE_SERVICES_SUFFIX: &str = ".cognitiveservices.azure.com";
+
+    let mut endpoint = reqwest::Url::parse(endpoint.trim()).map_err(|_| {
+        "Use the Azure Speech custom domain endpoint, for example https://your-resource.cognitiveservices.azure.com/.".to_string()
+    })?;
+    let host = endpoint.host_str().unwrap_or_default();
+    let resource_name =
+        host.strip_suffix(AZURE_COGNITIVE_SERVICES_SUFFIX)
+            .filter(|resource_name| {
+                !resource_name.is_empty()
+                    && resource_name
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '-')
+            });
+    if endpoint.scheme() != "https"
+        || resource_name.is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.port().is_some_and(|port| port != 443)
+        || endpoint.path() != "/"
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err("Use the Azure Speech custom domain endpoint, for example https://your-resource.cognitiveservices.azure.com/.".to_string());
+    }
+    endpoint.set_path("/speechtotext/transcriptions:transcribe");
+    endpoint.set_query(Some("api-version=2025-10-15"));
+    Ok(endpoint)
+}
+
+struct TemporaryMediaFile(Option<PathBuf>);
+
+impl TemporaryMediaFile {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn keep(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TemporaryMediaFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.as_ref() {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -193,16 +302,20 @@ fn normalize_capture_mode(capture_mode: Option<String>) -> String {
 }
 
 pub(crate) fn append_segment_to_store(
-    data_dir: &Path,
+    app: &AppHandle,
     meeting_id: &str,
     segment: TranscriptSegment,
 ) -> Result<()> {
-    let mut store = read_store(data_dir)?;
+    let state = app.state::<AppState>();
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| anyhow!("Store lock poisoned"))?;
     if let Some(meeting) = store.meetings.iter_mut().find(|item| item.id == meeting_id) {
         meeting.transcript.push(segment);
         meeting.updated_at = now_string();
     }
-    write_store(data_dir, &store)
+    write_store(&state.data_dir, &store)
 }
 
 #[tauri::command]
@@ -211,6 +324,17 @@ pub(crate) fn get_meetings(state: tauri::State<'_, AppState>) -> Result<Vec<Meet
         .store
         .lock()
         .map_err(|_| "Store lock poisoned".to_string())?;
+    Ok(store.meetings.clone())
+}
+
+#[tauri::command]
+pub(crate) fn refresh_meetings(state: tauri::State<'_, AppState>) -> Result<Vec<Meeting>, String> {
+    let refreshed = read_store(&state.data_dir).map_err(|error| error.to_string())?;
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "Store lock poisoned".to_string())?;
+    store.meetings = refreshed.meetings;
     Ok(store.meetings.clone())
 }
 
@@ -228,516 +352,16 @@ pub(crate) fn save_settings(
     state: tauri::State<'_, AppState>,
     settings: AppSettings,
 ) -> Result<(), String> {
-    {
-        let mut store = state
-            .store
-            .lock()
-            .map_err(|_| "Store lock poisoned".to_string())?;
-        store.settings = settings;
-    }
-    state.save_store().map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-pub(crate) fn load_whisper_model(
-    state: tauri::State<'_, AppState>,
-    model_path: String,
-) -> Result<(), String> {
-    let model_path = model_path.trim().to_string();
-    if model_path.is_empty() {
-        return Err("Enter the full path to a local Whisper .bin model file.".to_string());
-    }
-
-    let path = PathBuf::from(&model_path);
-    if !path.exists() {
-        return Err(format!("Whisper model file not found: {}", model_path));
-    }
-    if !path.is_file() {
-        return Err(format!("Whisper model path is not a file: {}", model_path));
-    }
-    if path.extension().and_then(|extension| extension.to_str()) != Some("bin") {
-        return Err("Whisper model must be a .bin file, for example ggml-base.en.bin.".to_string());
-    }
-
-    let context = WhisperContext::new_with_params(&model_path, WhisperContextParameters::default())
-        .map_err(|error| format!("Failed to load Whisper model: {error}"))?;
-    *state
-        .whisper
-        .lock()
-        .map_err(|_| "Whisper lock poisoned".to_string())? = Some(Arc::new(context));
-    {
-        let mut store = state
-            .store
-            .lock()
-            .map_err(|_| "Store lock poisoned".to_string())?;
-        store.whisper_model_path = Some(model_path);
-    }
-    state.save_store().map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-pub(crate) fn get_whisper_model_status(
-    state: tauri::State<'_, AppState>,
-) -> Result<WhisperModelStatus, String> {
-    let loaded = state
-        .whisper
-        .lock()
-        .map_err(|_| "Whisper lock poisoned".to_string())?
-        .is_some();
-    let store = state
+    let mut store = state
         .store
         .lock()
         .map_err(|_| "Store lock poisoned".to_string())?;
-    Ok(WhisperModelStatus {
-        loaded,
-        path: store.whisper_model_path.clone(),
-    })
-}
-
-fn get_or_load_whisper_context(state: &AppState) -> Result<Arc<WhisperContext>, String> {
-    if let Some(context) = state
-        .whisper
-        .lock()
-        .map_err(|_| "Whisper lock poisoned".to_string())?
-        .clone()
-    {
-        return Ok(context);
+    let previous = std::mem::replace(&mut store.settings, settings);
+    if let Err(error) = write_store(&state.data_dir, &store) {
+        store.settings = previous;
+        return Err(error.to_string());
     }
-
-    let model_path = {
-        let store = state
-            .store
-            .lock()
-            .map_err(|_| "Store lock poisoned".to_string())?;
-        store.whisper_model_path.clone()
-    };
-
-    // Fall back to auto-detecting a local model so recording can start without a
-    // manual "Load Model" step. Persist the detected path for later sessions.
-    let model_path = match model_path {
-        Some(path) if Path::new(&path).is_file() => path,
-        _ => {
-            let detected = crate::find_default_model(&fallback_model_dirs(&state.data_dir))
-                .ok_or_else(|| "No local Whisper model found. Add a ggml .bin model in the app models folder or load one from Settings.".to_string())?;
-            let detected = detected.to_string_lossy().to_string();
-            {
-                let mut store = state
-                    .store
-                    .lock()
-                    .map_err(|_| "Store lock poisoned".to_string())?;
-                store.whisper_model_path = Some(detected.clone());
-            }
-            let _ = state.save_store();
-            detected
-        }
-    };
-
-    let context = WhisperContext::new_with_params(&model_path, WhisperContextParameters::default())
-        .map_err(|error| format!("Failed to load Whisper model: {error}"))?;
-    let context = Arc::new(context);
-    *state
-        .whisper
-        .lock()
-        .map_err(|_| "Whisper lock poisoned".to_string())? = Some(context.clone());
-    Ok(context)
-}
-
-#[tauri::command]
-pub(crate) fn select_whisper_model(app: AppHandle) -> Result<Option<String>, String> {
-    let selected = app
-        .dialog()
-        .file()
-        .add_filter("Whisper ggml model", &["bin"])
-        .blocking_pick_file();
-
-    Ok(selected.map(|path| path.to_string()))
-}
-
-#[tauri::command]
-pub(crate) fn list_audio_input_devices() -> Result<Vec<AudioInputDevice>, String> {
-    list_input_devices()
-}
-
-#[tauri::command]
-pub(crate) fn list_audio_output_devices() -> Result<Vec<AudioOutputDevice>, String> {
-    list_output_devices()
-}
-
-#[tauri::command]
-pub(crate) fn start_recording(
-    app: AppHandle,
-    state: tauri::State<'_, AppState>,
-    meeting_title: Option<String>,
-    audio_device_id: Option<String>,
-    system_audio_device_id: Option<String>,
-    capture_mode: Option<String>,
-    language: Option<String>,
-    transcription_engine: Option<String>,
-) -> Result<Meeting, String> {
-    if state
-        .recorder
-        .lock()
-        .map_err(|_| "Recorder lock poisoned".to_string())?
-        .is_some()
-    {
-        return Err("Recording already in progress".to_string());
-    }
-
-    let transcription_engine = normalize_transcription_engine(transcription_engine);
-    let context = if transcription_engine == TranscriptionEngine::Local {
-        Some(get_or_load_whisper_context(&state)?)
-    } else {
-        None
-    };
-
-    let language = normalize_language(language);
-    let capture_mode = normalize_capture_mode(capture_mode);
-    let capture_microphone = capture_mode != "system";
-    let capture_system = capture_mode != "microphone";
-    let samples = Arc::new(Mutex::new(CaptureBuffers::default()));
-    let pending = Arc::new(Mutex::new(CaptureBuffers::default()));
-
-    // `cpal::Stream` is `!Send`, so a dedicated thread owns the streams for the
-    // whole recording. `start_recording` only keeps `Send` control handles,
-    // which makes "a stream crossing threads" unrepresentable and removes the
-    // need for any `unsafe impl Send`.
-    let (setup_tx, setup_rx) =
-        std::sync::mpsc::channel::<Result<crate::audio::AudioSetup, String>>();
-    let (audio_stop_tx, audio_stop_rx) = std::sync::mpsc::channel::<()>();
-    let samples_for_audio = samples.clone();
-    let pending_for_audio = pending.clone();
-    let audio_thread = std::thread::spawn(move || {
-        match build_capture_streams(
-            capture_microphone,
-            capture_system,
-            audio_device_id.as_deref(),
-            system_audio_device_id.as_deref(),
-            &capture_mode,
-            samples_for_audio,
-            pending_for_audio,
-        ) {
-            Ok((streams, setup)) => {
-                if setup_tx.send(Ok(setup)).is_err() {
-                    return;
-                }
-                // Keep the streams alive on this thread until stop is signalled,
-                // then drop them here so CPAL tears down on its owning thread.
-                let _ = audio_stop_rx.recv();
-                drop(streams);
-            }
-            Err(error) => {
-                let _ = setup_tx.send(Err(error));
-            }
-        }
-    });
-
-    let setup = match setup_rx.recv() {
-        Ok(Ok(setup)) => setup,
-        Ok(Err(error)) => return Err(error),
-        Err(_) => return Err("Audio capture thread stopped unexpectedly".to_string()),
-    };
-
-    let meeting = make_meeting(
-        meeting_title,
-        setup.resolved_audio_device_id,
-        setup.audio_device_name,
-        setup.resolved_system_audio_device_id,
-        setup.system_audio_device_name,
-        setup.resolved_capture_mode,
-        language.clone(),
-    );
-
-    let persisted = state
-        .store
-        .lock()
-        .map_err(|_| "Store lock poisoned".to_string())
-        .map(|mut store| store.meetings.insert(0, meeting.clone()))
-        .and_then(|_| state.save_store().map_err(|error| error.to_string()));
-    if let Err(error) = persisted {
-        let _ = audio_stop_tx.send(());
-        let _ = audio_thread.join();
-        return Err(error);
-    }
-
-    let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
-    let meeting_id = meeting.id.clone();
-    let data_dir = state.data_dir.clone();
-    let app_for_task = app.clone();
-    let pending_for_task = pending.clone();
-    let language_state = Arc::new(Mutex::new(language.clone()));
-    let language_for_task = language_state.clone();
-
-    tauri::async_runtime::spawn(async move {
-        let interval_duration = if transcription_engine == TranscriptionEngine::Azure {
-            Duration::from_millis(250)
-        } else {
-            Duration::from_secs(TRANSCRIPT_CHUNK_SECONDS)
-        };
-        let mut interval = tokio::time::interval(interval_duration);
-        let mut offset_seconds = 0.0;
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let chunk = pending_for_task
-                        .lock()
-                        .map(|mut buffer| CaptureBuffers {
-                            microphone: std::mem::take(&mut buffer.microphone),
-                            system: std::mem::take(&mut buffer.system),
-                        })
-                        .unwrap_or_default();
-                    let samples_16k = mix_sources(&chunk.microphone, &chunk.system);
-                    if samples_16k.is_empty() {
-                        continue;
-                    }
-                    let segment_offset = offset_seconds;
-                    offset_seconds += samples_16k.len() as f64 / TRANSCRIPT_SAMPLE_RATE;
-
-                    if transcription_engine == TranscriptionEngine::Azure {
-                        let _ = app_for_task.emit("audio-chunk", AudioChunkEvent {
-                            meeting_id: meeting_id.clone(),
-                            offset_seconds: segment_offset,
-                            pcm_base64: pcm16_base64(&samples_16k),
-                        });
-                        continue;
-                    }
-
-                    let chunk_language = language_for_task.lock().map(|value| value.clone()).unwrap_or_else(|_| default_language());
-                    let Some(context_for_chunk) = context.clone() else {
-                        continue;
-                    };
-                    // Whisper inference is CPU-bound and blocking; run it on the
-                    // blocking thread pool so it never stalls the async runtime
-                    // (event emission, stop signal, other tasks).
-                    let result = tokio::task::spawn_blocking(move || {
-                        transcribe_samples(context_for_chunk, samples_16k, &chunk_language)
-                    })
-                    .await
-                    .unwrap_or_else(|error| Err(anyhow!("Transcription task panicked: {error}")));
-                    match result {
-                        Ok(text) if !text.is_empty() => {
-                            let segment = TranscriptSegment {
-                                id: format!("segment-{}", Uuid::new_v4()),
-                                offset_seconds: segment_offset,
-                                text,
-                            };
-                            let _ = append_segment_to_store(&data_dir, &meeting_id, segment.clone());
-                            let _ = app_for_task.emit("transcript-segment", TranscriptEvent {
-                                meeting_id: meeting_id.clone(),
-                                segment,
-                            });
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            let _ = app_for_task.emit("transcription-error", error.to_string());
-                        }
-                    }
-                }
-                _ = stop_rx.recv() => break,
-            }
-        }
-    });
-
-    *state
-        .recorder
-        .lock()
-        .map_err(|_| "Recorder lock poisoned".to_string())? = Some(RecorderSession {
-        meeting_id: meeting.id.clone(),
-        stop_tx,
-        audio_stop_tx,
-        audio_thread,
-        samples,
-        language: language_state,
-        started_at: std::time::Instant::now(),
-    });
-
-    Ok(meeting)
-}
-
-#[tauri::command]
-pub(crate) fn add_transcript_segment(
-    app: AppHandle,
-    state: tauri::State<'_, AppState>,
-    meeting_id: String,
-    text: String,
-    offset_seconds: f64,
-) -> Result<TranscriptSegment, String> {
-    let text = text.trim().to_string();
-    if text.is_empty() {
-        return Err("Transcript segment text is empty".to_string());
-    }
-
-    let segment = TranscriptSegment {
-        id: format!("segment-{}", Uuid::new_v4()),
-        offset_seconds: offset_seconds.max(0.0),
-        text,
-    };
-    {
-        let mut store = state
-            .store
-            .lock()
-            .map_err(|_| "Store lock poisoned".to_string())?;
-        let meeting = store
-            .meetings
-            .iter_mut()
-            .find(|item| item.id == meeting_id)
-            .ok_or_else(|| "Meeting not found".to_string())?;
-        meeting.transcript.push(segment.clone());
-        meeting.updated_at = now_string();
-    }
-    state.save_store().map_err(|error| error.to_string())?;
-    let _ = app.emit(
-        "transcript-segment",
-        TranscriptEvent {
-            meeting_id,
-            segment: segment.clone(),
-        },
-    );
-    Ok(segment)
-}
-
-#[tauri::command]
-pub(crate) async fn get_azure_cli_access_token(
-    tenant_id: Option<String>,
-    subscription_id: Option<String>,
-) -> Result<AzureCliAccessToken, String> {
-    azure_auth::get_azure_cli_access_token(tenant_id, subscription_id).await
-}
-
-#[tauri::command]
-pub(crate) async fn sign_in_azure_cli(
-    tenant_id: Option<String>,
-    subscription_id: Option<String>,
-) -> AzureCliStatus {
-    azure_auth::sign_in_azure_cli(tenant_id, subscription_id).await
-}
-
-#[tauri::command]
-pub(crate) async fn check_azure_cli_sign_in(
-    tenant_id: Option<String>,
-    subscription_id: Option<String>,
-) -> AzureCliStatus {
-    azure_auth::check_azure_cli_sign_in(tenant_id, subscription_id).await
-}
-
-#[tauri::command]
-pub(crate) fn stop_recording(state: tauri::State<'_, AppState>) -> Result<Meeting, String> {
-    let session = state
-        .recorder
-        .lock()
-        .map_err(|_| "Recorder lock poisoned".to_string())?
-        .take()
-        .ok_or_else(|| "Recording is not running".to_string())?;
-
-    let _ = session.stop_tx.try_send(());
-    let _ = session.audio_stop_tx.send(());
-    let _ = session.audio_thread.join();
-
-    let samples_16k = {
-        let samples = session
-            .samples
-            .lock()
-            .map_err(|_| "Sample buffer lock poisoned".to_string())?;
-        mix_sources(&samples.microphone, &samples.system)
-    };
-    let duration = session.started_at.elapsed().as_secs_f64();
-    let recording_path = state
-        .data_dir
-        .join("recordings")
-        .join(format!("{}.wav", session.meeting_id));
-    write_wav(&recording_path, &samples_16k, 16_000).map_err(|error| error.to_string())?;
-    let persisted_meeting = read_store(&state.data_dir).ok().and_then(|store| {
-        store
-            .meetings
-            .into_iter()
-            .find(|meeting| meeting.id == session.meeting_id)
-    });
-
-    let updated = {
-        let mut store = state
-            .store
-            .lock()
-            .map_err(|_| "Store lock poisoned".to_string())?;
-        let meeting = store
-            .meetings
-            .iter_mut()
-            .find(|item| item.id == session.meeting_id)
-            .ok_or_else(|| "Meeting not found".to_string())?;
-        if let Some(persisted_meeting) = persisted_meeting {
-            if persisted_meeting.transcript.len() > meeting.transcript.len() {
-                meeting.transcript = persisted_meeting.transcript;
-            }
-        }
-        meeting.duration_seconds = duration;
-        meeting.has_audio = true;
-        meeting.recording_path = Some(recording_path.to_string_lossy().to_string());
-        meeting.updated_at = now_string();
-        meeting.clone()
-    };
-    state.save_store().map_err(|error| error.to_string())?;
-    Ok(updated)
-}
-
-#[tauri::command]
-pub(crate) fn rename_meeting(
-    state: tauri::State<'_, AppState>,
-    meeting_id: String,
-    title: String,
-) -> Result<Meeting, String> {
-    let updated = {
-        let mut store = state
-            .store
-            .lock()
-            .map_err(|_| "Store lock poisoned".to_string())?;
-        let meeting = store
-            .meetings
-            .iter_mut()
-            .find(|item| item.id == meeting_id)
-            .ok_or_else(|| "Meeting not found".to_string())?;
-        meeting.title = title;
-        meeting.updated_at = now_string();
-        meeting.clone()
-    };
-    state.save_store().map_err(|error| error.to_string())?;
-    Ok(updated)
-}
-
-#[tauri::command]
-pub(crate) fn update_meeting_language(
-    state: tauri::State<'_, AppState>,
-    meeting_id: String,
-    language: String,
-) -> Result<Meeting, String> {
-    let language = normalize_language(Some(language));
-    let updated = {
-        let mut store = state
-            .store
-            .lock()
-            .map_err(|_| "Store lock poisoned".to_string())?;
-        let meeting = store
-            .meetings
-            .iter_mut()
-            .find(|item| item.id == meeting_id)
-            .ok_or_else(|| "Meeting not found".to_string())?;
-        meeting.language = language.clone();
-        meeting.updated_at = now_string();
-        meeting.clone()
-    };
-    {
-        let recorder = state
-            .recorder
-            .lock()
-            .map_err(|_| "Recorder lock poisoned".to_string())?;
-        if let Some(session) = recorder
-            .as_ref()
-            .filter(|session| session.meeting_id == meeting_id)
-        {
-            if let Ok(mut current_language) = session.language.lock() {
-                *current_language = language;
-            }
-        }
-    }
-    state.save_store().map_err(|error| error.to_string())?;
-    Ok(updated)
+    Ok(())
 }
 
 #[tauri::command]
@@ -838,11 +462,20 @@ pub(crate) fn export_audio(
         .ok_or_else(|| "Recording not found".to_string())?;
     drop(store);
 
-    let default_name = format!("{}-recording.wav", safe_file_stem(&meeting.title));
+    let extension = Path::new(&source)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "wav".to_string());
+    let (filter_name, filter_extensions): (&str, &[&str]) = match extension.as_str() {
+        "mp3" => ("MP3 audio", &["mp3"]),
+        _ => ("WAV audio", &["wav"]),
+    };
+    let default_name = format!("{}-recording.{extension}", safe_file_stem(&meeting.title));
     let Some(path) = app
         .dialog()
         .file()
-        .add_filter("WAV audio", &["wav"])
+        .add_filter(filter_name, filter_extensions)
         .set_file_name(&default_name)
         .blocking_save_file()
     else {
@@ -978,8 +611,8 @@ pub(crate) fn set_mini_mode(app: AppHandle, enabled: bool) -> Result<(), String>
         )
     } else {
         (
-            LogicalSize::new(640.0, 560.0),
-            LogicalSize::new(760.0, 760.0),
+            LogicalSize::new(960.0, 560.0),
+            LogicalSize::new(1040.0, 760.0),
         )
     };
     window

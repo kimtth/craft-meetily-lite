@@ -1,9 +1,13 @@
 mod audio;
 mod azure_auth;
 mod commands;
+mod video;
 
-use anyhow::{anyhow, Result};
-use audio::CaptureBuffers;
+#[cfg(test)]
+mod test;
+
+use anyhow::{anyhow, Context, Result};
+use audio::{CaptureBuffers, IncrementalWavWriter};
 use rodio::Sink;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -44,6 +48,8 @@ pub struct Meeting {
     pub capture_mode: String,
     #[serde(default = "default_language")]
     pub language: String,
+    #[serde(default = "default_transcription_engine")]
+    pub transcription_engine: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +77,26 @@ pub struct WhisperModelStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct VideoRecording {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub duration_seconds: f64,
+    pub status: String,
+    pub target_name: String,
+    pub codec: String,
+    pub video_path: String,
+    #[serde(default)]
+    pub has_audio: Option<bool>,
+    #[serde(default)]
+    pub audio_path: Option<String>,
+    #[serde(default)]
+    pub post_process_stage: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TranscriptEvent {
     pub meeting_id: String,
     pub segment: TranscriptSegment,
@@ -82,6 +108,32 @@ pub struct AudioChunkEvent {
     pub meeting_id: String,
     pub offset_seconds: f64,
     pub pcm_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenAudioLevelEvent {
+    pub microphone: f32,
+    pub system: f32,
+    pub mixed: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenProcessingStatusEvent {
+    pub stage: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingRuntimeStatus {
+    pub audio_recording_active: bool,
+    pub audio_meeting_id: Option<String>,
+    pub audio_elapsed_seconds: f64,
+    pub screen_recording_active: bool,
+    pub screen_video_id: Option<String>,
+    pub screen_elapsed_seconds: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +149,7 @@ pub(crate) enum TranscriptionEngine {
 pub struct AppSettings {
     pub transcription_engine: String,
     pub capture_mode: String,
+    pub screen_audio_capture_mode: String,
     pub audio_device_id: String,
     pub system_audio_device_id: String,
     pub language: String,
@@ -104,12 +157,17 @@ pub struct AppSettings {
     pub azure_tenant_id: String,
     pub azure_subscription_id: String,
     pub azure_language: String,
+    pub video_output_folder: String,
+    pub video_codec: String,
+    pub ffmpeg_path: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Store {
     pub(crate) meetings: Vec<Meeting>,
+    #[serde(default)]
+    pub(crate) videos: Vec<VideoRecording>,
     pub(crate) whisper_model_path: Option<String>,
     #[serde(default)]
     pub(crate) settings: AppSettings,
@@ -120,7 +178,10 @@ pub(crate) struct RecorderSession {
     pub(crate) stop_tx: mpsc::Sender<()>,
     pub(crate) audio_stop_tx: std::sync::mpsc::Sender<()>,
     pub(crate) audio_thread: std::thread::JoinHandle<()>,
-    pub(crate) samples: Arc<Mutex<CaptureBuffers>>,
+    pub(crate) audio_done_rx: std::sync::mpsc::Receiver<()>,
+    pub(crate) recording_samples: Arc<Mutex<CaptureBuffers>>,
+    pub(crate) audio_writer: Arc<Mutex<Option<IncrementalWavWriter>>>,
+    pub(crate) recording_path: PathBuf,
     pub(crate) language: Arc<Mutex<String>>,
     pub(crate) started_at: std::time::Instant,
 }
@@ -132,9 +193,19 @@ pub(crate) struct PlaybackSession {
     pub(crate) thread: std::thread::JoinHandle<()>,
 }
 
+pub(crate) struct ScreenRecorderSession {
+    pub(crate) video_id: String,
+    pub(crate) capture: video::ScreenCaptureProcess,
+    pub(crate) audio_stop_tx: Option<std::sync::mpsc::Sender<()>>,
+    pub(crate) audio_thread: Option<std::thread::JoinHandle<()>>,
+    pub(crate) started_at: std::time::Instant,
+}
+
 pub(crate) struct AppState {
     pub(crate) store: Mutex<Store>,
+    pub(crate) recording_lifecycle_lock: Mutex<()>,
     pub(crate) recorder: Mutex<Option<RecorderSession>>,
+    pub(crate) screen_recorder: Mutex<Option<ScreenRecorderSession>>,
     pub(crate) playback: Mutex<Option<PlaybackSession>>,
     pub(crate) whisper: Mutex<Option<Arc<WhisperContext>>>,
     pub(crate) data_dir: PathBuf,
@@ -166,7 +237,9 @@ impl AppState {
 
         Ok(Self {
             store: Mutex::new(store),
+            recording_lifecycle_lock: Mutex::new(()),
             recorder: Mutex::new(None),
+            screen_recorder: Mutex::new(None),
             playback: Mutex::new(None),
             whisper: Mutex::new(None),
             data_dir,
@@ -262,14 +335,16 @@ pub(crate) fn read_store(data_dir: &Path) -> Result<Store> {
         write_store(data_dir, &store)?;
         return Ok(store);
     }
-    let raw = fs::read_to_string(path)?;
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("Could not read {}", path.display()))?;
     Ok(serde_json::from_str(&raw).unwrap_or_default())
 }
 
 pub(crate) fn write_store(data_dir: &Path, store: &Store) -> Result<()> {
     fs::create_dir_all(data_dir)?;
-    fs::write(store_path(data_dir), serde_json::to_string_pretty(store)?)?;
-    Ok(())
+    let path = store_path(data_dir);
+    let serialized = serde_json::to_string_pretty(store)?;
+    fs::write(&path, serialized).with_context(|| format!("Could not write {}", path.display()))
 }
 
 pub(crate) fn default_language() -> String {
@@ -280,32 +355,67 @@ pub(crate) fn default_capture_mode() -> String {
     "microphoneSystem".to_string()
 }
 
+pub(crate) fn default_transcription_engine() -> String {
+    "local".to_string()
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let state = AppState::new(app)
                 .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
             app.manage(state);
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let state = app_handle.state::<AppState>();
+                let lifecycle_guard = state.recording_lifecycle_lock.lock();
+                match lifecycle_guard {
+                    Ok(_guard) => {
+                        if let Err(error) = commands::screen::recover_incomplete_screen_recordings(
+                            &app_handle,
+                            &state,
+                        ) {
+                            eprintln!("Could not recover incomplete screen recordings: {error}");
+                        }
+                    }
+                    Err(_) => eprintln!("Could not lock screen recording recovery state."),
+                }
+            });
             Ok(())
         })
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::get_meetings,
-            commands::list_audio_input_devices,
-            commands::list_audio_output_devices,
-            commands::load_whisper_model,
-            commands::select_whisper_model,
-            commands::get_whisper_model_status,
+            commands::refresh_meetings,
+            commands::screen::get_videos,
+            commands::screen::refresh_videos,
+            commands::screen::get_recording_runtime_status,
+            commands::meetings::list_audio_input_devices,
+            commands::meetings::list_audio_output_devices,
+            commands::screen::list_screen_targets,
+            commands::screen::open_area_selector,
+            commands::screen::complete_area_selection,
+            commands::screen::cancel_area_selection,
+            commands::screen::select_video_output_folder,
+            commands::screen::select_ffmpeg_executable,
+            commands::screen::open_video_recordings_folder,
+            commands::meetings::load_whisper_model,
+            commands::meetings::select_whisper_model,
+            commands::meetings::get_whisper_model_status,
             commands::get_settings,
             commands::save_settings,
-            commands::start_recording,
-            commands::stop_recording,
-            commands::add_transcript_segment,
-            commands::get_azure_cli_access_token,
-            commands::sign_in_azure_cli,
-            commands::check_azure_cli_sign_in,
-            commands::rename_meeting,
-            commands::update_meeting_language,
+            commands::meetings::start_recording,
+            commands::meetings::stop_recording,
+            commands::screen::start_screen_recording,
+            commands::screen::stop_screen_recording,
+            commands::transcription::select_fast_transcription_audio,
+            commands::transcription::transcribe_fast_audio,
+            commands::meetings::add_transcript_segment,
+            commands::meetings::get_azure_cli_access_token,
+            commands::meetings::sign_in_azure_cli,
+            commands::meetings::check_azure_cli_sign_in,
+            commands::meetings::rename_meeting,
+            commands::meetings::update_meeting_language,
             commands::delete_meeting,
             commands::export_transcript,
             commands::export_audio,

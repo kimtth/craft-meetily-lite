@@ -37,9 +37,20 @@ function normalizeSpeechEndpoint(endpoint: string): URL {
 
   const url = new URL(trimmed);
   const isRegionalCognitiveEndpoint = url.hostname.endsWith('.api.cognitive.microsoft.com');
-  const isCustomDomainEndpoint = url.hostname.endsWith('.cognitiveservices.azure.com');
+  const customDomainSuffix = '.cognitiveservices.azure.com';
+  const resourceName = url.hostname.endsWith(customDomainSuffix)
+    ? url.hostname.slice(0, -customDomainSuffix.length)
+    : '';
+  const isCustomDomainEndpoint = /^[a-z0-9-]+$/i.test(resourceName)
+    && url.protocol === 'https:'
+    && !url.username
+    && !url.password
+    && (!url.port || url.port === '443')
+    && url.pathname === '/'
+    && !url.search
+    && !url.hash;
 
-  if (isCustomDomainEndpoint && !isRegionalCognitiveEndpoint) {
+  if (isCustomDomainEndpoint) {
     return url;
   }
 
