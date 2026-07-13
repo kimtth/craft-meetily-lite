@@ -67,15 +67,14 @@ pub(crate) async fn transcribe_fast_audio(
         fs::create_dir_all(&staging_folder).map_err(|error| error.to_string())?;
         let extracted = staging_folder.join(format!("fast-source-{}.mp3", Uuid::new_v4()));
         let extracted_guard = TemporaryMediaFile::new(extracted.clone());
-        video::extract_mp3(&app, &source, &extracted).map_err(|error| error.to_string())?;
+        video::encode_mp3(&app, &source, &extracted).map_err(|error| error.to_string())?;
         source = extracted;
         temporary_source = Some(extracted_guard);
         (extension, _, source_duration) = fast_transcription_file_details(&source)?;
     }
 
     let token = azure_auth::get_azure_cli_access_token(tenant_id, subscription_id).await?;
-    let audio = reqwest::multipart::Part::file(&source)
-        .await
+    let audio = fs::read(&source)
         .map_err(|error| format!("Could not open the selected audio file: {error}"))?;
     let file_name = source
         .file_name()
@@ -91,7 +90,7 @@ pub(crate) async fn transcribe_fast_audio(
     let form = reqwest::multipart::Form::new()
         .part(
             "audio",
-            audio
+            reqwest::multipart::Part::bytes(audio)
                 .file_name(file_name)
                 .mime_str(mime_type)
                 .map_err(|error| error.to_string())?,

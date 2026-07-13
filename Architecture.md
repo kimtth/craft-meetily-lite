@@ -1,9 +1,7 @@
 ---
 title: Meetly Lite Architecture
-description: Architecture, runtime flows, and validation for Meetly Lite
+description: Architecture, native API, and build guidance for Meetly Lite
 ---
-
-## Meetly Lite Architecture
 
 Meetly Lite is generated at the workspace root. The reference project in `ref-meetily/` is read-only input and must not be modified.
 
@@ -12,18 +10,17 @@ Meetly Lite is generated at the workspace root. The reference project in `ref-me
 * Compact side-panel transcription UI inspired by Microsoft Teams meeting panels
 * Rust/Tauri recording control flow
 * Local Whisper model loading through `whisper-rs`
+* Optional Azure Speech live recognition and Fast Transcription for selected WAV, MP3, and MP4 files
 * Selectable microphone input capture through `cpal`
 * Simultaneous microphone and system audio capture with mixed recording output
 * Capture modes for microphone only, system audio only, or microphone plus system audio
-* Per-session Whisper transcription language selection
-* Azure Speech for optional live recognition and Fast Transcription of one saved WAV, MP3, or MP4 file
-* Separate Windows screen recording for an entire desktop or fixed area with H.264 or H.265 MP4 encoding
-* Screen recording mini mode with capture controls, audio meters, and processing status
-* Durable video finalization with automatic recovery of incomplete recordings
+* Per-session transcription language selection
 * Transcript segments emitted from Rust to the UI through Tauri events
 * Local meeting and transcript history stored under the app data directory
-* Transcript export as `.txt` and recorded audio export as `.wav` or `.mp3`
+* Transcript export as `.txt` and recorded audio export in the stored file format
 * Recorded audio playback with per-transcript-segment navigation
+* Desktop and user-selected-area screen recording with FFmpeg H.264 or H.265 encoding
+* Local video catalog, export folder selection, and incomplete-recording recovery
 * Optional build-time Whisper acceleration for CUDA or Vulkan
 * No AI summary workflow
 
@@ -47,13 +44,17 @@ flowchart TD
 	Rust[Rust backend core]
 	Audio[cpal microphone capture]
 	Whisper[whisper-rs transcription]
+	Azure[Azure Speech optional cloud transcription]
+	Screen[FFmpeg screen recording]
 	Store[Local app data store]
-	Exports[Transcript and WAV exports]
+	Exports[Transcript, audio, and video exports]
 
 	UI --> Tauri
 	Tauri --> Rust
 	Rust --> Audio
 	Rust --> Whisper
+	Rust --> Azure
+	Rust --> Screen
 	Rust --> Store
 	Rust --> Exports
 	Rust -- transcript-segment events --> UI
@@ -191,7 +192,7 @@ shown in File Explorer.
 4. Choose the downloaded `ggml-*.bin` model file.
 5. Select `Load Model`.
 6. Choose the capture mode, microphone input, system audio output, and session language.
-7. Use the floating audio-record control to start a meeting recording.
+7. Start recording from the microphone button.
 
 Do not use `npm run dev` to test model loading. The browser-only Vite preview
 cannot call Tauri native commands and cannot load Whisper models.
@@ -202,10 +203,12 @@ The root Tauri backend provides these commands to the frontend:
 
 * `get_meetings`
 * `refresh_meetings`
-* `list_audio_input_devices`
-* `list_audio_output_devices`
 * `get_videos`
 * `refresh_videos`
+* `delete_video`
+* `get_recording_runtime_status`
+* `list_audio_input_devices`
+* `list_audio_output_devices`
 * `list_screen_targets`
 * `open_area_selector`
 * `complete_area_selection`
@@ -251,94 +254,66 @@ loading a local Whisper model file.
 
 ## Azure Speech Fast Transcription
 
-File transcription uses the synchronous Azure Speech Fast Transcription REST
-endpoint. The native backend validates WAV, MP3, or MP4 input, a 250 MB maximum
-file size, and a two-hour maximum duration before it sends a multipart request.
-It accepts only an HTTPS root URL whose host is an Azure Cognitive Services
-custom domain. Redirects are disabled so the bearer token cannot leave that
-host. The upload streams from disk and uses connection and total operation
-deadlines. Azure CLI obtains the Microsoft Entra token, and the signed-in
-identity must have the `Cognitive Services User` role on the Speech resource.
-Tenant and subscription identifiers accept only Azure identifier characters
-before they are forwarded through the Windows Azure CLI launcher, preventing
-shell metacharacters from reaching `cmd.exe`.
+Fast Transcription accepts one WAV, MP3, or MP4 file. Before upload, the native
+backend validates the file type, a 250 MB maximum file size, and a two-hour
+maximum duration. It accepts only an HTTPS Azure Cognitive Services custom
+domain endpoint and disables redirects before sending the bearer token.
 
-MP4 input is converted locally to a guarded temporary MP3 before upload. That
-conversion is managed by the configured FFmpeg runtime, not Azure Speech. The
-temporary file is removed on success or failure. Audio is sent directly to the
-configured custom-domain Azure Speech endpoint. Azure Blob Storage, storage
-account keys, and SAS URLs are not part of this flow. After Azure Speech returns
-timestamped phrases, Meetly copies the source audio into its local recordings
-directory and stores the transcript as a normal meeting for playback and
-export. The final audio copy remains guarded until metadata commits.
+MP4 input is converted locally to a temporary MP3 through the configured FFmpeg
+runtime. The temporary file is removed after the request completes. Meetly sends
+audio directly to Azure Speech and does not use Azure Blob Storage, storage
+account keys, or SAS URLs. Azure CLI obtains the Microsoft Entra access token;
+the signed-in identity needs the `Cognitive Services User` role on the Speech
+resource.
 
-The Fast Transcription service returns a final result synchronously. The UI
-therefore shows local stages, validation, upload, transcription, and saving,
-rather than a server-provided completion percentage. Its completion-time value
-is an estimate calculated from the source duration.
+After Azure Speech returns timestamped phrases, Meetly stores the transcript and
+a local copy of the submitted audio as a meeting. The UI reports validation,
+upload, transcription, and saving stages while the synchronous request runs.
 
 ## Screen Recording Finalization and Recovery
 
-Screen recording uses FFmpeg `gdigrab` to create a fragmented `.partial.mp4`
-in the configured output directory. For recording modes that include audio, the
-native audio capture writes a WAV file under the private temporary path
-`%TEMP%\MeetlyLite\screen-audio`. The persisted `VideoRecording` metadata keeps
-the temporary video path, staged audio path, and status.
+Screen recording uses FFmpeg to create a fragmented `.partial.mp4` in the
+configured output directory. When the selected capture mode includes audio,
+native audio capture stages a WAV file in the system temporary directory.
 
-The H.264 and H.265 paths encode `yuv420p`, which requires even frame width and
-height. The backend rounds a selected area down by one pixel per odd dimension
-before it creates the `ScreenTarget`, and applies the same normalization when a
-recording starts. After it spawns FFmpeg, it watches briefly for an immediate
-exit. If the encoder fails to start, for example because of an invalid frame
-size, it returns the FFmpeg diagnostics and rolls back the staged assets rather
-than reporting an active recording. FFmpeg diagnostics are drained on a
-background thread and kept as a bounded tail.
+H.264 and H.265 output uses `yuv420p`, so the backend normalizes selected-area
+dimensions to even values. On stop, the backend stops FFmpeg and audio capture,
+muxes staged audio when available, validates the completed output, then renames
+the result to its final `.mp4` file. It emits `screen-processing-status` events
+for the processing stages.
 
-When `stop_screen_recording` runs, the backend follows this sequence:
+At startup and before `refresh_videos` reads the output directory, Meetly retries
+inactive incomplete recordings with a nonempty partial MP4. Empty partial files
+are marked as capture failures. Intermediate `.partial.mp4` and `.muxing.mp4`
+files are not imported into the saved-video catalog.
 
-1. Send FFmpeg the `q` command and wait for the process to exit. A closed input
-  pipe is accepted when FFmpeg has already stopped.
-2. Stop and join the audio capture thread.
-3. Mux the temporary MP4 and WAV into a separate `.muxing.mp4` output when
-  audio was captured.
-4. Validate the completed video through FFmpeg.
-5. Rename the validated output to the final `.mp4`, then remove the temporary
-  source video and staged WAV.
+## Audio Encoding Recovery
 
-The backend emits `screen-processing-status` events for stopping capture,
-mixing audio, validating the recording, and saving the final file. React uses
-these events in both the full screen-recording workspace and screen mini mode.
-The video list labels recordings as ready, recording, processing, recovery
-pending, or capture failed. Fast Transcription is available only when the video
-status is saved.
-
-If any finalization step fails, the backend preserves the partial MP4 and WAV
-and sets the video status to `post-processing-failed`. At startup and before
-`refresh_videos` reads the output folder, the backend retries every inactive
-incomplete recording that still has video data. A zero-byte partial MP4 cannot
-be recovered because FFmpeg encoded no video frames, so the backend labels it
-`capture-failed` and does not retry it. Intermediate `.partial.mp4` and
-`.muxing.mp4` files are not imported as ordinary videos. The frontend queries
-native session state after a WebView reload so an active recording keeps its
-elapsed time and stop control.
+Meeting recordings are first finalized as WAV files and then encoded to MP3. If
+encoding fails or the app closes before the conversion completes, the WAV stays
+associated with the meeting. At the next app startup, Meetly retries conversion
+for persisted non-file-transcription WAV recordings. It updates the meeting to
+the MP3 path and deletes the WAV only after the updated store is written.
 
 ## Native Runtime Flow
 
 ```mermaid
 flowchart TD
 	UI[React side-panel UI]
-	Model[Load Whisper model path]
-	Record[Start recording command]
-	Audio[Microphone audio stream]
-	STT[Whisper transcription chunks]
+	Engine[Local Whisper or Azure Speech]
+	Record[Start audio or screen recording]
+	Audio[Microphone and system audio stream]
+	STT[Transcription chunks]
+	Screen[FFmpeg screen capture]
 	Events[Tauri transcript events]
-	Stop[Stop recording command]
-	Files[WAV and transcript exports]
+	Stop[Stop and finalize recording]
+	Files[MP3, MP4, and transcript exports]
 
-	UI --> Model
+	UI --> Engine
 	UI --> Record
 	Record --> Audio
 	Audio --> STT
+	Record --> Screen
 	STT --> Events
 	Events --> UI
 	UI --> Stop

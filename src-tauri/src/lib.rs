@@ -175,6 +175,7 @@ pub(crate) struct Store {
 
 pub(crate) struct RecorderSession {
     pub(crate) meeting_id: String,
+    pub(crate) prior_recording_path: Option<PathBuf>,
     pub(crate) stop_tx: mpsc::Sender<()>,
     pub(crate) audio_stop_tx: std::sync::mpsc::Sender<()>,
     pub(crate) audio_thread: std::thread::JoinHandle<()>,
@@ -377,6 +378,12 @@ pub fn run() {
                         ) {
                             eprintln!("Could not recover incomplete screen recordings: {error}");
                         }
+                        if let Err(error) = commands::meetings::recover_incomplete_audio_encodings(
+                            &app_handle,
+                            &state,
+                        ) {
+                            eprintln!("Could not recover incomplete audio encodings: {error}");
+                        }
                     }
                     Err(_) => eprintln!("Could not lock screen recording recovery state."),
                 }
@@ -389,6 +396,7 @@ pub fn run() {
             commands::refresh_meetings,
             commands::screen::get_videos,
             commands::screen::refresh_videos,
+            commands::screen::delete_video,
             commands::screen::get_recording_runtime_status,
             commands::meetings::list_audio_input_devices,
             commands::meetings::list_audio_output_devices,

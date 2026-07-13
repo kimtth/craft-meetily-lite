@@ -1362,6 +1362,30 @@ button:disabled {
   font-size: 13px;
 }
 
+.mini-screen-target {
+  display: grid;
+  gap: 3px;
+  padding: 8px 9px;
+  border-left: 3px solid #4f7ec6;
+  background: #f5f8fc;
+}
+
+.mini-screen-target span:first-child {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mini-screen-target span:last-child {
+  color: var(--muted);
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
 .mini-screen-recording > p {
   margin: 0;
   color: var(--muted);
@@ -1477,4 +1501,14 @@ button:disabled {
     grid-template-columns: 52px minmax(0, 1fr);
     gap: 10px;
   }
+}
+
+.video-list-actions {
+  display: flex;
+  flex: none;
+  gap: 6px;
+}
+
+.video-list-actions .video-delete-button {
+  color: var(--danger);
 }

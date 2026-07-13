@@ -1,4 +1,4 @@
-import { CircleStop, FileText, FolderOpen, Mic, Monitor, MousePointer2, RefreshCw, Volume2, Video } from 'lucide-react';
+import { CircleStop, FileText, FolderOpen, Mic, Monitor, MousePointer2, RefreshCw, Trash2, Volume2, Video } from 'lucide-react';
 import type { ReactNode } from 'react';
 import type { RecorderStatus, ScreenAudioLevels, ScreenProcessingStatus, ScreenTarget, VideoRecording } from '../types';
 import { CAPTURE_MODE_OPTIONS } from '../audio/recordingOptions';
@@ -24,6 +24,7 @@ type Props = {
   onOpenRecordingsFolder: () => void;
   onRefreshVideos: () => void;
   onGenerateTranscription: (video: VideoRecording) => void;
+  onDeleteVideo: (videoId: string) => void;
   refreshingVideos: boolean;
   transcribing: boolean;
 };
@@ -31,7 +32,7 @@ type Props = {
 export function ScreenRecordingWorkspace({
   status, targets, selectedTarget, codec, videos, statusDisplay,
   captureMode, audioLevels, onSelectScreen, onSelectArea, onCodecChange, onCaptureModeChange, onStart, onStop, onOpenRecordingsFolder,
-  processingStatus, onRefreshVideos, onGenerateTranscription, refreshingVideos, transcribing,
+  processingStatus, onRefreshVideos, onGenerateTranscription, onDeleteVideo, refreshingVideos, transcribing,
 }: Props) {
   const canChangeTarget = status === 'idle';
   const audioSources = [
@@ -109,9 +110,14 @@ export function ScreenRecordingWorkspace({
         </div>
         {videos.map((video) => <article className="video-list-item" key={video.id}>
           <div><strong>{video.title}</strong><span>{new Date(video.createdAt).toLocaleString()} · {formatTimestamp(video.durationSeconds)} · {video.codec.toUpperCase()}</span><small className={`video-status ${video.status}`}>{videoStatusLabel(video)}</small>{video.status === 'capture-failed' && <span className="video-status-detail">No video frames were encoded. Select the area again and retry.</span>}{video.status === 'saved' && video.hasAudio === false && <span className="video-status-detail">{video.postProcessStage === 'audio-capture-failed' ? 'The video was saved, but screen audio capture failed.' : 'This recording was created without an audio track.'}</span>}</div>
-          <button type="button" className="video-icon-button" onClick={() => onGenerateTranscription(video)} disabled={video.status !== 'saved' || video.hasAudio === false || transcribing} title="Generate transcription" aria-label={`Generate transcription for ${video.title}`}>
-            <FileText size={16} />
-          </button>
+          <div className="video-list-actions">
+            <button type="button" className="video-icon-button" onClick={() => onGenerateTranscription(video)} disabled={video.status !== 'saved' || video.hasAudio === false || transcribing} title="Generate transcription" aria-label={`Generate transcription for ${video.title}`}>
+              <FileText size={16} />
+            </button>
+            <button type="button" className="video-icon-button video-delete-button" onClick={() => onDeleteVideo(video.id)} disabled={video.status === 'recording' || video.status === 'post-processing'} title="Remove video" aria-label={`Remove ${video.title}`}>
+              <Trash2 size={16} />
+            </button>
+          </div>
         </article>)}
         {videos.length === 0 && <p className="empty-list">No saved videos</p>}
       </div>

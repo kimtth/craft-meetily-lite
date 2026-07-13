@@ -32,4 +32,4 @@ Meetly writes a fragmented `.partial.mp4` while recording, mixes staged audio in
 
 ### FFmpeg licensing
 
-The bundled FFmpeg 8.1.2 essentials build is a static GPLv3 build from Gyan Doshi's Windows FFmpeg builds. Its exact build configuration and the GNU GPL v3 text are included in the installed `resources` directory as `FFMPEG-BUILD-README.txt` and `GPL-3.0.txt`. Corresponding FFmpeg source is available at <https://github.com/FFmpeg/FFmpeg/commit/38b88335f9>.
+The bundled FFmpeg 8.1.2 essentials build is a static GPLv3 build from Gyan Doshi's Windows FFmpeg builds. <https://github.com/FFmpeg/FFmpeg/commit/38b88335f9>.

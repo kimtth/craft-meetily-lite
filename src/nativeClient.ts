@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { AudioInputDevice, AudioOutputDevice, AppSettings, FastTranscriptionFile, FastTranscriptionProgress, Meeting, RecordingOptions, RecordingRuntimeStatus, ScreenAudioLevels, ScreenProcessingStatus, ScreenTarget, TranscriptSegment, VideoRecording, WhisperModelStatus } from './types';
 
@@ -6,7 +6,7 @@ const FALLBACK_MEETINGS_KEY = 'meetly-lite:fallback-meetings';
 const FALLBACK_SETTINGS_KEY = 'meetly-lite:settings';
 
 function hasTauriRuntime(): boolean {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  return typeof window !== 'undefined' && isTauri();
 }
 
 function readFallbackJson<T>(key: string, fallback: T): T {
@@ -98,6 +98,7 @@ export async function startNativeRecording(options: RecordingOptions = {}): Prom
   }
   return invoke<Meeting>('start_recording', {
     meetingTitle: options.meetingTitle,
+    appendToMeetingId: options.appendToMeetingId,
     audioDeviceId: options.audioDeviceId,
     systemAudioDeviceId: options.systemAudioDeviceId,
     captureMode: options.captureMode,
@@ -308,6 +309,13 @@ export async function fetchVideos(): Promise<VideoRecording[]> {
 export async function refreshVideos(): Promise<VideoRecording[]> {
   if (!hasTauriRuntime()) return [];
   return invoke<VideoRecording[]>('refresh_videos');
+}
+
+export async function deleteNativeVideo(videoId: string): Promise<void> {
+  if (!hasTauriRuntime()) {
+    return requireTauriRuntime('Video deletion');
+  }
+  return invoke<void>('delete_video', { videoId });
 }
 
 export async function listScreenTargets(): Promise<ScreenTarget[]> {

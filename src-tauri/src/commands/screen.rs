@@ -194,6 +194,45 @@ pub(crate) fn get_videos(state: tauri::State<'_, AppState>) -> Result<Vec<VideoR
     Ok(store.videos.clone())
 }
 
+#[tauri::command]
+pub(crate) fn delete_video(
+    state: tauri::State<'_, AppState>,
+    video_id: String,
+) -> Result<(), String> {
+    let is_active = state
+        .screen_recorder
+        .lock()
+        .map_err(|_| "Screen recorder lock poisoned".to_string())?
+        .as_ref()
+        .is_some_and(|session| session.video_id == video_id);
+    if is_active {
+        return Err("Stop the screen recording before removing it.".to_string());
+    }
+
+    let video = state
+        .store
+        .lock()
+        .map_err(|_| "Store lock poisoned".to_string())?
+        .videos
+        .iter()
+        .find(|video| video.id == video_id)
+        .cloned()
+        .ok_or_else(|| "Video recording not found".to_string())?;
+
+    for path in [Some(video.video_path.as_str()), video.audio_path.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let path = Path::new(path);
+        if path.exists() {
+            fs::remove_file(path)
+                .map_err(|error| format!("Could not remove {}: {error}", path.display()))?;
+        }
+    }
+
+    remove_video_recording(&state, &video_id)
+}
+
 #[tauri::command(async)]
 pub(crate) fn get_recording_runtime_status(
     state: tauri::State<'_, AppState>,
@@ -240,6 +279,12 @@ pub(crate) fn refresh_videos(
     recover_incomplete_screen_recordings(&app, &state).map_err(|error| error.to_string())?;
     let output_folder = video_output_folder(&state)?;
     fs::create_dir_all(&output_folder).map_err(|error| error.to_string())?;
+    let active_video_id = state
+        .screen_recorder
+        .lock()
+        .map_err(|_| "Screen recorder lock poisoned".to_string())?
+        .as_ref()
+        .map(|session| session.video_id.clone());
     let existing = state
         .store
         .lock()
@@ -309,9 +354,15 @@ pub(crate) fn refresh_videos(
         let already_included = videos.iter().any(|current| {
             current.id == video.id || current.video_path.eq_ignore_ascii_case(&video.video_path)
         });
-        // Keep in-progress or failed recordings, whose partial files are not
-        // scanned as ordinary videos, so their metadata survives a refresh.
-        if !already_included && video.status != "saved" {
+        if already_included {
+            continue;
+        }
+        let is_active = active_video_id.as_deref() == Some(video.id.as_str());
+        let file_present = Path::new(&video.video_path).exists();
+        // Keep the active in-progress recording, plus any non-saved recording
+        // whose file still exists on disk. Drop stale failed/in-progress entries
+        // whose underlying files were removed so they no longer linger in the list.
+        if is_active || (video.status != "saved" && file_present) {
             videos.push(video);
         }
     }
