@@ -80,6 +80,7 @@ export type WhisperModelStatus = {
 
 export type RecordingOptions = {
   meetingTitle?: string;
+  appendToMeetingId?: string;
   audioDeviceId?: string;
   systemAudioDeviceId?: string;
   captureMode?: string;

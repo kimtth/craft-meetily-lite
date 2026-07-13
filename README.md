@@ -1,6 +1,25 @@
 ## Meetly Lite
 
-Windows-first meeting transcription with Local Whisper for on-device recording and optional Azure Speech for live or file transcription.
+Windows-first **meeting transcription** and **screen recording** with Local Whisper for on-device recording and optional Azure Speech for live or file transcription.
+
+<table>
+	<tr>
+		<td align="center">
+			<img src="docs/screen_a.png" alt="Meetly Lite meeting transcription workspace" />
+		</td>
+		<td align="center">
+			<img src="docs/screen_b.png" alt="Meetly Lite Azure Speech batch transcription workspace" />
+		</td>
+		<td align="center">
+			<img src="docs/screen_v.png" alt="Meetly Lite screen recording workspace" />
+		</td>
+	</tr>
+	<tr>
+		<td align="center"><sub>Meeting transcription with Local Whisper or Azure Speech</sub></td>
+		<td align="center"><sub>Azure Speech batch transcription for WAV, MP3, and MP4 files</sub></td>
+		<td align="center"><sub>Screen recording for an entire display or selected area</sub></td>
+	</tr>
+</table>
 
 ## Start
 
@@ -9,27 +28,33 @@ npm install
 npm run tauri:dev
 ```
 
-Build with `npm run tauri:build`. Select a local `ggml-*.bin` Whisper model in Settings, or place one in `models/` for auto-detection. Do not use `npm run dev` for native features.
+* Build with `npm run tauri:build`.
+* Select a local `ggml-*.bin` Whisper model in Settings, or place one in `models/` for auto-detection.
+* Do not use `npm run dev` for native features.
+* Builds run `npm run prepare:ffmpeg` first, which downloads FFmpeg 8.1.2 when needed.
+* GPU build commands and output paths are listed in [Architecture.md](Architecture.md).
 
-Builds run `npm run prepare:ffmpeg` first, which downloads the pinned FFmpeg 8.1.2 essentials build into the bundle resources only when it is missing or fails its checksum. GPU-accelerated builds (`tauri:build:cuda`, `tauri:build:vulkan`) and their output paths are documented in [Architecture.md](Architecture.md).
+## Speech-to-Text Engine
 
-## Azure Speech
-
-Azure Speech uses Azure CLI sign-in and requires the `Cognitive Services User` role. File transcription accepts one WAV, MP3, or MP4 file up to 250 MB and two hours, uploads it directly to Azure Speech, and stores the audio and timestamped transcript locally. For MP4 input, Meetly extracts MP3 locally before upload. Azure Speech does not manage that conversion. Azure Blob Storage is not used.
+* Sign in to Azure CLI and assign the `Cognitive Services User` role.
+* Transcribe one WAV, MP3, or MP4 file up to 250 MB and two hours.
+* Meetly uploads files directly to Azure Speech and stores audio and timestamped transcripts locally.
+* MP4 audio is extracted locally as MP3 before upload.
+* Azure Blob Storage is not used.
 
 > [!IMPORTANT]
-> Azure Speech sends audio to a cloud service. Use Local Whisper when audio must remain on the device.
-
-See [Architecture.md](Architecture.md) for build variants and implementation details.
+> Azure Speech sends audio to the cloud. Use Local Whisper to keep audio on the device.
 
 ## Screen recording
 
-Screen recording captures an entire desktop or a fixed area to local MP4 with H.264 or H.265 encoding. Choose an output folder from the Video tab in Settings. FFmpeg performs capture, compression, audio muxing, and automatic MP4-to-MP3 conversion during Azure Speech Fast Transcription. 
-
-The bundled FFmpeg runtime is used by default. To use a different executable, select it from the Video settings. Video recording is separate from transcription; use the transcript icon on a saved video to send its audio directly to Azure Speech Fast Transcription. 
-
-Meetly writes a fragmented `.partial.mp4` while recording, mixes staged audio in after stop, validates the result, then commits the final `.mp4`. Incomplete recordings are retried when the app reopens or the video list is refreshed. See [Architecture.md](Architecture.md) for finalization, recovery, and encoding details.
+* Record an entire desktop or fixed area to local H.264 or H.265 MP4.
+* Choose the output folder in Video settings.
+* FFmpeg handles capture, encoding, audio mixing, and MP4-to-MP3 conversion.
+* The bundled FFmpeg runtime is used by default. You can select another executable.
+* Transcription is separate. Use a saved video's transcript icon to send its audio to Azure Speech.
+* Recordings use `.partial.mp4`, then mix audio, validate, and commit the final `.mp4`.
+* Incomplete recordings retry on app reopen or video list refresh.
 
 ### FFmpeg licensing
 
-The bundled FFmpeg 8.1.2 essentials build is a static GPLv3 build from Gyan Doshi's Windows FFmpeg builds. Its exact build configuration and the GNU GPL v3 text are included in the installed `resources` directory as `FFMPEG-BUILD-README.txt` and `GPL-3.0.txt`. Corresponding FFmpeg source is available at <https://github.com/FFmpeg/FFmpeg/commit/38b88335f9>.
+The bundled FFmpeg 8.1.2 essentials build is static GPLv3 software from Gyan Doshi's Windows builds: <https://github.com/FFmpeg>.

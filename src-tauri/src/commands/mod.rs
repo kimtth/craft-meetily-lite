@@ -330,12 +330,23 @@ pub(crate) fn get_meetings(state: tauri::State<'_, AppState>) -> Result<Vec<Meet
 #[tauri::command]
 pub(crate) fn refresh_meetings(state: tauri::State<'_, AppState>) -> Result<Vec<Meeting>, String> {
     let refreshed = read_store(&state.data_dir).map_err(|error| error.to_string())?;
+    let meetings: Vec<Meeting> = refreshed
+        .meetings
+        .into_iter()
+        .filter(|meeting| match &meeting.recording_path {
+            // Drop meetings whose recorded audio file was deleted from disk.
+            Some(path) => Path::new(path).exists(),
+            // Keep transcript-only meetings that never had an audio file.
+            None => true,
+        })
+        .collect();
     let mut store = state
         .store
         .lock()
         .map_err(|_| "Store lock poisoned".to_string())?;
-    store.meetings = refreshed.meetings;
-    Ok(store.meetings.clone())
+    store.meetings = meetings.clone();
+    write_store(&state.data_dir, &store).map_err(|error| error.to_string())?;
+    Ok(meetings)
 }
 
 #[tauri::command]

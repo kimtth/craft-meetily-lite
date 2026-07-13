@@ -56,6 +56,52 @@ pub(crate) fn get_whisper_model_status(
     })
 }
 
+pub(crate) fn recover_incomplete_audio_encodings(app: &AppHandle, state: &AppState) -> Result<()> {
+    let pending = state
+        .store
+        .lock()
+        .map_err(|_| anyhow!("Store lock poisoned"))?
+        .meetings
+        .iter()
+        .filter_map(|meeting| {
+            let path = meeting.recording_path.as_deref()?;
+            let path = PathBuf::from(path);
+            (meeting.transcription_engine != "azure-fast"
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+                && path.is_file())
+            .then(|| (meeting.id.clone(), path))
+        })
+        .collect::<Vec<_>>();
+
+    for (meeting_id, wav_path) in pending {
+        let mp3_path = wav_path.with_extension("mp3");
+        if let Err(error) = video::encode_mp3(app, &wav_path, &mp3_path) {
+            eprintln!("Could not recover audio encoding for {meeting_id}: {error}");
+            continue;
+        }
+
+        let mut store = state
+            .store
+            .lock()
+            .map_err(|_| anyhow!("Store lock poisoned"))?;
+        let Some(meeting) = store.meetings.iter_mut().find(|meeting| {
+            meeting.id == meeting_id
+                && meeting.recording_path.as_deref() == Some(wav_path.to_string_lossy().as_ref())
+        }) else {
+            continue;
+        };
+        meeting.recording_path = Some(mp3_path.to_string_lossy().to_string());
+        meeting.updated_at = now_string();
+        write_store(&state.data_dir, &store)?;
+        drop(store);
+        let _ = fs::remove_file(wav_path);
+    }
+
+    Ok(())
+}
+
 fn get_or_load_whisper_context(state: &AppState) -> Result<Arc<WhisperContext>, String> {
     if let Some(context) = state
         .whisper
@@ -132,6 +178,7 @@ pub(crate) fn start_recording(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
     meeting_title: Option<String>,
+    append_to_meeting_id: Option<String>,
     audio_device_id: Option<String>,
     system_audio_device_id: Option<String>,
     capture_mode: Option<String>,
@@ -227,33 +274,85 @@ pub(crate) fn start_recording(
         }
     };
 
-    let mut meeting = make_meeting(MeetingOptions {
-        title: meeting_title,
-        audio_device_id: setup.resolved_audio_device_id,
-        audio_device_name: setup.audio_device_name,
-        system_audio_device_id: setup.resolved_system_audio_device_id,
-        system_audio_device_name: setup.system_audio_device_name,
-        capture_mode: setup.resolved_capture_mode,
-        language: language.clone(),
-        transcription_engine: match transcription_engine {
-            TranscriptionEngine::Local => "local".to_string(),
-            TranscriptionEngine::Azure => "azure".to_string(),
-        },
-    });
+    let append_to_meeting_id = append_to_meeting_id
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty());
+    let existing_meeting = if let Some(meeting_id) = append_to_meeting_id.as_deref() {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "Store lock poisoned".to_string())?;
+        Some(
+            store
+                .meetings
+                .iter()
+                .find(|meeting| meeting.id == meeting_id)
+                .cloned()
+                .ok_or_else(|| "The open meeting session no longer exists.".to_string())?,
+        )
+    } else {
+        None
+    };
+    let engine = match transcription_engine {
+        TranscriptionEngine::Local => "local".to_string(),
+        TranscriptionEngine::Azure => "azure".to_string(),
+    };
+    let is_appending = existing_meeting.is_some();
+    // When appending, keep the open session's transcript and existing audio and
+    // just refresh the capture metadata for the new segment.
+    let prior_recording_path = existing_meeting
+        .as_ref()
+        .and_then(|meeting| meeting.recording_path.as_deref())
+        .map(PathBuf::from);
+    let mut meeting = match existing_meeting {
+        Some(mut meeting) => {
+            meeting.audio_device_id = setup.resolved_audio_device_id;
+            meeting.audio_device_name = setup.audio_device_name;
+            meeting.system_audio_device_id = setup.resolved_system_audio_device_id;
+            meeting.system_audio_device_name = setup.system_audio_device_name;
+            meeting.capture_mode = setup.resolved_capture_mode;
+            meeting.language = language.clone();
+            meeting.transcription_engine = engine;
+            meeting
+        }
+        None => make_meeting(MeetingOptions {
+            title: meeting_title,
+            audio_device_id: setup.resolved_audio_device_id,
+            audio_device_name: setup.audio_device_name,
+            system_audio_device_id: setup.resolved_system_audio_device_id,
+            system_audio_device_name: setup.system_audio_device_name,
+            capture_mode: setup.resolved_capture_mode,
+            language: language.clone(),
+            transcription_engine: engine,
+        }),
+    };
     // Persist the destination before capture begins. Each chunk is flushed by
     // the recording task, so a crash leaves the completed portion on disk.
     meeting.has_audio = true;
-    meeting.recording_path = Some(recording_path.to_string_lossy().to_string());
+    if !is_appending {
+        meeting.recording_path = Some(recording_path.to_string_lossy().to_string());
+    }
 
     let persisted = {
         let mut store = state
             .store
             .lock()
             .map_err(|_| "Store lock poisoned".to_string())?;
-        store.meetings.insert(0, meeting.clone());
+        if is_appending {
+            let target = store
+                .meetings
+                .iter_mut()
+                .find(|item| item.id == meeting.id)
+                .ok_or_else(|| "The open meeting session no longer exists.".to_string())?;
+            *target = meeting.clone();
+        } else {
+            store.meetings.insert(0, meeting.clone());
+        }
         let persist = write_store(&state.data_dir, &store).map_err(|error| error.to_string());
         if persist.is_err() {
-            store.meetings.retain(|item| item.id != meeting.id);
+            if !is_appending {
+                store.meetings.retain(|item| item.id != meeting.id);
+            }
         }
         persist
     };
@@ -277,6 +376,7 @@ pub(crate) fn start_recording(
     let audio_writer_for_task = audio_writer.clone();
     let language_for_task = Arc::new(Mutex::new(language));
     let language_for_recorder = language_for_task.clone();
+    let initial_transcript_offset = meeting.duration_seconds;
 
     tauri::async_runtime::spawn(async move {
         let interval_duration = if transcription_engine == TranscriptionEngine::Azure {
@@ -285,7 +385,7 @@ pub(crate) fn start_recording(
             Duration::from_secs(TRANSCRIPT_CHUNK_SECONDS)
         };
         let mut interval = tokio::time::interval(interval_duration);
-        let mut offset_seconds = 0.0;
+        let mut offset_seconds = initial_transcript_offset;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -371,6 +471,7 @@ pub(crate) fn start_recording(
         .lock()
         .map_err(|_| "Recorder lock poisoned".to_string())? = Some(RecorderSession {
         meeting_id: meeting.id.clone(),
+        prior_recording_path,
         stop_tx,
         audio_stop_tx,
         audio_thread,
@@ -452,7 +553,10 @@ pub(crate) async fn check_azure_cli_sign_in(
 }
 
 #[tauri::command(async)]
-pub(crate) fn stop_recording(state: tauri::State<'_, AppState>) -> Result<Meeting, String> {
+pub(crate) fn stop_recording(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Meeting, String> {
     let _lifecycle_guard = state
         .recording_lifecycle_lock
         .lock()
@@ -499,6 +603,24 @@ pub(crate) fn stop_recording(state: tauri::State<'_, AppState>) -> Result<Meetin
         }
     }
     let duration = session.started_at.elapsed().as_secs_f64();
+    let encoded_path = session.recording_path.with_extension("mp3");
+    video::encode_mp3(&app, &session.recording_path, &encoded_path)
+        .map_err(|error| format!("Could not save the meeting audio as MP3: {error}"))?;
+    // When appending, concatenate the prior meeting audio with the new segment
+    // into a fresh file; otherwise the encoded MP3 is the final recording.
+    let recording_path = match session.prior_recording_path.as_deref() {
+        Some(previous_path) if previous_path.is_file() => {
+            let merged_path = state.data_dir.join("recordings").join(format!(
+                "{}-{}.mp3",
+                session.meeting_id,
+                Uuid::new_v4()
+            ));
+            video::concatenate_audio(&app, previous_path, &encoded_path, &merged_path)
+                .map_err(|error| format!("Could not append the meeting audio: {error}"))?;
+            merged_path
+        }
+        _ => encoded_path.clone(),
+    };
     let persisted_meeting = read_store(&state.data_dir).ok().and_then(|store| {
         store
             .meetings
@@ -521,13 +643,23 @@ pub(crate) fn stop_recording(state: tauri::State<'_, AppState>) -> Result<Meetin
                 meeting.transcript = persisted_meeting.transcript;
             }
         }
-        meeting.duration_seconds = duration;
+        meeting.duration_seconds += duration;
         meeting.has_audio = true;
-        meeting.recording_path = Some(session.recording_path.to_string_lossy().to_string());
+        meeting.recording_path = Some(recording_path.to_string_lossy().to_string());
         meeting.updated_at = now_string();
         meeting.clone()
     };
     state.save_store().map_err(|error| error.to_string())?;
+    // Remove the raw WAV and any intermediate files the final MP3 superseded.
+    let _ = fs::remove_file(&session.recording_path);
+    if encoded_path != recording_path {
+        let _ = fs::remove_file(&encoded_path);
+    }
+    if let Some(previous_path) = session.prior_recording_path {
+        if previous_path != recording_path {
+            let _ = fs::remove_file(previous_path);
+        }
+    }
     Ok(updated)
 }
 
