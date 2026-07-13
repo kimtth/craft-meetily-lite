@@ -27,6 +27,8 @@ import {
   fetchMeetings,
   refreshMeetings,
   deleteNativeMeeting,
+  deleteNativeVideo,
+  renameNativeVideo,
   exportNativeAudio,
   exportNativeTranscript,
   getNativeSettings,
@@ -150,6 +152,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showRecordingList, setShowRecordingList] = useState(false);
+  const [showRecordingChoice, setShowRecordingChoice] = useState(false);
   const [showBatchTranscription, setShowBatchTranscription] = useState(false);
   const [showVideoWorkspace, setShowVideoWorkspace] = useState(false);
   const [settingsTab, setSettingsTab] = useState<'audio' | 'video'>('audio');
@@ -545,11 +548,14 @@ export default function App() {
     }
   };
 
-  const handleStartRecording = async () => {
+  const handleStartRecording = async (appendToMeetingId?: string) => {
     setError(null);
     setStatus('starting');
     setShowRecordingList(false);
     setAzurePartialText('');
+    const appendOffsetSeconds = appendToMeetingId === activeMeeting?.id
+      ? activeMeeting?.durationSeconds ?? 0
+      : 0;
     let azureSession: AzureSpeechSession | null = null;
     let audioChunkCleanup: (() => void) | null = null;
     try {
@@ -588,7 +594,7 @@ export default function App() {
           onFinalText: async (text, offsetSeconds) => {
             const meetingId = activeMeetingIdRef.current;
             if (meetingId) {
-              await addNativeTranscriptSegment(meetingId, text, offsetSeconds);
+              await addNativeTranscriptSegment(meetingId, text, offsetSeconds + appendOffsetSeconds);
               setAzurePartialText('');
             }
           },
@@ -601,6 +607,7 @@ export default function App() {
         });
       }
       const meeting = await startNativeRecording({
+        appendToMeetingId,
         audioDeviceId: selectedAudioInputId,
         systemAudioDeviceId: selectedSystemAudioOutputId,
         captureMode: selectedCaptureMode,
@@ -612,8 +619,8 @@ export default function App() {
       setMeetings((current) => upsertMeeting(current, meeting));
       setActiveMeetingId(meeting.id);
       activeMeetingIdRef.current = meeting.id;
-      setElapsedSeconds(0);
-      elapsedSecondsRef.current = 0;
+      setElapsedSeconds(appendOffsetSeconds);
+      elapsedSecondsRef.current = appendOffsetSeconds;
       setStatus('recording');
       startTimers();
       // Reflect the model the backend actually loaded (e.g. an auto-detected one).
@@ -633,6 +640,24 @@ export default function App() {
       setStatus('idle');
       setError(getErrorMessage(recordingError, 'Native recording could not start.'));
     }
+  };
+
+  const handleOpenRecordingChoice = () => {
+    setError(null);
+    setShowRecordingChoice(true);
+  };
+
+  const handleStartNewRecording = () => {
+    setShowRecordingChoice(false);
+    void handleStartRecording();
+  };
+
+  const handleAppendToOpenMeeting = () => {
+    if (!activeMeeting) {
+      return;
+    }
+    setShowRecordingChoice(false);
+    void handleStartRecording(activeMeeting.id);
   };
 
   const handleSelectFastTranscriptionFile = async () => {
@@ -708,8 +733,13 @@ export default function App() {
       setStatus('idle');
     } catch (stopError) {
       setError(stopError instanceof Error ? stopError.message : 'Failed to stop recording.');
-      setStatus('recording');
-      startTimers();
+      audioChunkCleanupRef.current?.();
+      audioChunkCleanupRef.current = null;
+      await azureSessionRef.current?.stop();
+      azureSessionRef.current = null;
+      setAzurePartialText('');
+      setStatus('idle');
+      void refreshMeetings().then(setMeetings).catch(() => undefined);
     }
   };
 
@@ -751,6 +781,7 @@ export default function App() {
       setScreenAudioLevels({ microphone: 0, system: 0, mixed: 0 });
       setScreenStatus('recording');
       screenElapsedTimerRef.current = window.setInterval(() => setScreenElapsedSeconds((seconds) => seconds + 1), 1000);
+      handleMiniModeChange(true, 'screen');
     } catch (screenError) {
       activeScreenVideoIdRef.current = null;
       setScreenStatus('idle');
@@ -895,6 +926,26 @@ export default function App() {
     if (completed) {
       setShowVideoWorkspace(false);
       setShowRecordingList(false);
+    }
+  };
+
+  const handleDeleteVideo = async (videoId: string) => {
+    try {
+      await deleteNativeVideo(videoId);
+      setVideos((current) => current.filter((video) => video.id !== videoId));
+      setError(null);
+    } catch (deleteError) {
+      setError(getErrorMessage(deleteError, 'Could not remove the video recording.'));
+    }
+  };
+
+  const handleRenameVideo = async (videoId: string, title: string) => {
+    try {
+      const video = await renameNativeVideo(videoId, title);
+      setVideos((current) => current.map((item) => item.id === video.id ? video : item));
+      setError(null);
+    } catch (renameError) {
+      setError(getErrorMessage(renameError, 'Could not rename the video recording.'));
     }
   };
 
@@ -1125,7 +1176,7 @@ export default function App() {
                 className="mini-record"
                 status={status}
                 iconSize={17}
-                onStart={handleStartRecording}
+                onStart={handleOpenRecordingChoice}
                 onStop={handleStopRecording}
                 title={status === 'idle' ? 'Start recording' : 'Stop recording'}
               />
@@ -1139,6 +1190,12 @@ export default function App() {
         {screenMiniMode ? (
           <main className="mini-screen-recording" aria-label="Screen recording controls">
             <strong>{screenProcessingStatus?.stage ?? 'Screen recording'}</strong>
+            {selectedScreenTarget && (
+              <div className="mini-screen-target">
+                <span>{selectedScreenTarget.name}</span>
+                <span>{selectedScreenTarget.x}, {selectedScreenTarget.y} · {selectedScreenTarget.width} × {selectedScreenTarget.height} · {screenAudioCaptureMode}</span>
+              </div>
+            )}
             <div className="mini-screen-audio" aria-label="Screen recording audio mix">
               {screenAudioSources.map((source) => (
                 <div className={`mini-screen-audio-source ${source.tone} ${source.active ? '' : 'inactive'}`} key={source.label}>
@@ -1300,6 +1357,8 @@ export default function App() {
             onOpenRecordingsFolder={handleOpenVideoRecordingsFolder}
             onRefreshVideos={handleRefreshVideos}
             onGenerateTranscription={handleGenerateVideoTranscription}
+            onDeleteVideo={handleDeleteVideo}
+            onRenameVideo={handleRenameVideo}
             refreshingVideos={refreshingVideos}
             transcribing={fastTranscribing}
           />
@@ -1639,7 +1698,7 @@ export default function App() {
             className="primary-stop"
             status={status}
             iconSize={20}
-            onStart={handleStartRecording}
+            onStart={handleOpenRecordingChoice}
             onStop={handleStopRecording}
           />
         </div>
@@ -1663,6 +1722,37 @@ export default function App() {
               </button>
               <button type="button" className="modal-danger" onClick={handleConfirmSwitch}>
                 Stop &amp; switch
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {showRecordingChoice && (
+        <div className="modal-backdrop" role="presentation" onClick={() => setShowRecordingChoice(false)}>
+          <div
+            className="modal-card"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="recording-choice-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h2 id="recording-choice-title">Start recording</h2>
+            <p>Choose whether to create a new meeting session or add this recording to the session currently open.</p>
+            <div className="modal-actions recording-choice-actions">
+              <button type="button" className="modal-secondary" onClick={() => setShowRecordingChoice(false)}>
+                Cancel
+              </button>
+              <button type="button" className="modal-secondary" onClick={handleStartNewRecording}>
+                New recording
+              </button>
+              <button
+                type="button"
+                className="modal-danger"
+                onClick={handleAppendToOpenMeeting}
+                disabled={!activeMeeting}
+                title={activeMeeting ? `Append to ${activeMeeting.title}` : 'Open a saved meeting to append to it'}
+              >
+                Append to open session
               </button>
             </div>
           </div>

@@ -372,7 +372,7 @@ pub(crate) fn mux_audio(
     run_ffmpeg_command(&mut command, "add audio to the screen recording")
 }
 
-pub(crate) fn extract_mp3(app: &AppHandle, source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn encode_mp3(app: &AppHandle, source: &Path, destination: &Path) -> Result<()> {
     let ffmpeg = ffmpeg_path(app)?;
     let mut command = Command::new(ffmpeg);
     command
@@ -383,5 +383,33 @@ pub(crate) fn extract_mp3(app: &AppHandle, source: &Path, destination: &Path) ->
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     suppress_console_window(&mut command);
-    run_ffmpeg_command(&mut command, "extract MP3 audio from the video")
+    run_ffmpeg_command(&mut command, "encode MP3 audio")
+}
+
+pub(crate) fn concatenate_audio(
+    app: &AppHandle,
+    first: &Path,
+    second: &Path,
+    destination: &Path,
+) -> Result<()> {
+    let ffmpeg = ffmpeg_path(app)?;
+    let mut command = Command::new(ffmpeg);
+    command
+        .args(["-hide_banner", "-loglevel", "warning", "-y", "-i"])
+        .arg(first)
+        .arg("-i")
+        .arg(second)
+        .args([
+            "-filter_complex",
+            "[0:a:0][1:a:0]concat=n=2:v=0:a=1",
+            "-codec:a",
+            "libmp3lame",
+            "-q:a",
+            "3",
+        ])
+        .arg(destination)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    suppress_console_window(&mut command);
+    run_ffmpeg_command(&mut command, "append audio to the meeting recording")
 }

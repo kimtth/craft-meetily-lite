@@ -20,8 +20,11 @@ modules:
 * `src-tauri/src/audio/mod.rs` owns audio mechanics: device listing, CPAL stream
   creation, sample conversion, 16 kHz resampling, microphone/system mixing, WAV
   writing, and local playback setup.
-* `src-tauri/src/commands/mod.rs` owns Tauri command handlers. These functions
-  are the native API called by `src/nativeClient.ts`.
+* `src-tauri/src/commands/mod.rs` declares shared command support and focused
+  command modules. These functions are the native API called by
+  `src/nativeClient.ts`.
+* `src-tauri/src/commands/screen.rs` owns screen recording, video catalog,
+  video deletion, and persisted video renaming.
 * `src-tauri/src/azure_auth.rs` owns Azure CLI authentication. It shells out to
   `az` for interactive login/account switching and runs
   `az account get-access-token` to issue bearer tokens for Azure Speech.
@@ -136,6 +139,9 @@ not a member or guest of the selected tenant.
 * Add or rename a frontend command wrapper in `src/nativeClient.ts`, then add or
   rename the matching `#[tauri::command]` function in `src-tauri/src/commands/`.
   Tauri maps camelCase TypeScript arguments to snake_case Rust parameters.
+* `rename_video` is the command for video catalog titles. It trims and rejects
+  empty titles, updates `updated_at`, and writes the title to the local store.
+  It does not rename the completed MP4 file.
 * Add fields to `Meeting` in `src-tauri/src/lib.rs` and `src/types.ts`. Use
   `#[serde(default)]` when old stored JSON files should continue loading.
 * Change audio capture behavior in `src-tauri/src/audio/mod.rs`.
