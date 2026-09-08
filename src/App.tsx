@@ -20,10 +20,11 @@ import {
   RefreshCw,
   Volume2,
 } from 'lucide-react';
-import type { AppSettings, FastTranscriptionFile, FastTranscriptionProgress, Meeting, RecorderStatus, ScreenAudioLevels, ScreenProcessingStatus, ScreenTarget, TranscriptSegment, TranscriptionEngine, VideoRecording } from './types';
+import type { AppSettings, FastTranscriptionFile, FastTranscriptionProgress, FoundryDownloadProgress, FoundryLocalChunkingMode, FoundryLocalModelCatalogEntry, Meeting, RecorderStatus, ScreenAudioLevels, ScreenProcessingStatus, ScreenTarget, TranscriptSegment, TranscriptionEngine, VideoRecording } from './types';
 import {
   addNativeTranscriptSegment,
   checkAzureCliSignIn,
+  downloadFoundryLocalModel,
   fetchMeetings,
   refreshMeetings,
   deleteNativeMeeting,
@@ -33,19 +34,23 @@ import {
   exportNativeTranscript,
   getNativeSettings,
   getRecordingRuntimeStatus,
-  getWhisperModelStatus,
+  listFoundryLocalModels,
   listNativeAudioInputDevices,
   listNativeAudioOutputDevices,
-  loadWhisperModel,
   onAudioChunk,
+  onCallMuteWarning,
+  onFoundryDownloadProgress,
+  onMicrophoneMuteChanged,
+  onRecordingError,
+  onTranscriptionError,
   onTranscriptSegment,
   openNativeMeetingFolder,
   onFastTranscriptionProgress,
   pauseNativePlayback,
   playNativeRecording,
   renameNativeMeeting,
+  renameNativeSpeaker,
   resumeNativePlayback,
-  selectWhisperModel,
   signInAzureCli,
   saveNativeSettings,
   selectFastTranscriptionAudio,
@@ -68,10 +73,38 @@ import {
 } from './nativeClient';
 import { startAzureSpeechSession } from './azureSpeech';
 import type { AzureSpeechSession } from './azureSpeech';
-import type { AzureCliStatus } from './nativeClient';
+import type { AzureCliStatus, NativeAudioChunkEvent, NativeRecordingErrorEvent } from './nativeClient';
 import { formatTimestamp } from './exporters';
-import { AZURE_LANGUAGE_OPTIONS, CAPTURE_MODE_OPTIONS, LANGUAGE_OPTIONS } from './audio/recordingOptions';
+import { AZURE_LANGUAGE_OPTIONS, CAPTURE_MODE_OPTIONS, LANGUAGE_OPTIONS, normalizeAzureLanguage, normalizeFoundryLanguage } from './audio/recordingOptions';
 import { ScreenRecordingWorkspace } from './video/ScreenRecordingWorkspace';
+import MeetingAssistant from './assistant/MeetingAssistant';
+
+const FOUNDRY_LANGUAGE_OPTIONS = LANGUAGE_OPTIONS.filter((option) => option.value !== 'auto');
+
+type AzureRecordingPipe = {
+  meetingId: string | null;
+  session: AzureSpeechSession | null;
+  chunks: NativeAudioChunkEvent[];
+  bufferedChars: number;
+  cleanup: (() => void) | null;
+  closed: boolean;
+};
+
+// Object identity distinguishes successive capture attempts, including appends
+// to the same meeting. Never use the currently selected meeting for cleanup.
+type RecordingAttempt = {
+  meetingId: string | null;
+  pendingErrors: Map<string, NativeRecordingErrorEvent>;
+  failure: NativeRecordingErrorEvent | null;
+};
+
+// About 90 seconds of base64 PCM. Never grow indefinitely during auth/reconnect.
+const MAX_AZURE_BUFFER_CHARS = 4 * 1024 * 1024;
+const MAX_AZURE_BUFFER_CHUNKS = 512;
+const SPEAKER_BADGE_STYLE = {
+  display: 'inline-block', padding: '2px 6px', marginRight: 6,
+  borderRadius: 6, background: 'var(--panel-soft)', color: 'var(--muted)', fontSize: 11,
+} as const;
 
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error) {
@@ -101,18 +134,37 @@ function getRecorderStatusLabel(status: RecorderStatus): string {
   return status === 'idle' ? 'Ready' : `${status[0].toUpperCase()}${status.slice(1)}`;
 }
 
+function isTranscriptionEngine(value: string | undefined): value is TranscriptionEngine {
+  return value === 'azure' || value === 'foundryLocal';
+}
+
+function migrateTranscriptionEngine(value: string | undefined): TranscriptionEngine {
+  return isTranscriptionEngine(value) ? value : 'foundryLocal';
+}
+
+function foundryModelLabel(model: FoundryLocalModelCatalogEntry): string {
+  return model.displayName ? `${model.displayName} (${model.alias})` : model.alias;
+}
+
 type RecorderStatusDisplayProps = {
   className: string;
   status: RecorderStatus;
   elapsedSeconds: number;
+  microphoneMuted?: boolean;
 };
 
-function RecorderStatusDisplay({ className, status, elapsedSeconds }: RecorderStatusDisplayProps) {
+function RecorderStatusDisplay({
+  className,
+  status,
+  elapsedSeconds,
+  microphoneMuted = false,
+}: RecorderStatusDisplayProps) {
+  const isMuted = status === 'recording' && microphoneMuted;
   return (
     <div className={className}>
-      <span className={`state-dot ${status}`} />
+      <span className={`state-dot ${isMuted ? 'muted' : status}`} />
       <div>
-        <strong>{getRecorderStatusLabel(status)}</strong>
+        <strong>{isMuted ? 'Mic muted' : getRecorderStatusLabel(status)}</strong>
         <span>{formatTimestamp(elapsedSeconds)}</span>
       </div>
     </div>
@@ -150,6 +202,8 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [callMuteWarning, setCallMuteWarning] = useState<string | null>(null);
+  const [microphoneMuted, setMicrophoneMuted] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showRecordingList, setShowRecordingList] = useState(false);
   const [showRecordingChoice, setShowRecordingChoice] = useState(false);
@@ -162,15 +216,13 @@ export default function App() {
   const [playingMeetingId, setPlayingMeetingId] = useState<string | null>(null);
   const [playingSegmentId, setPlayingSegmentId] = useState<string | null>(null);
   const [playbackPaused, setPlaybackPaused] = useState(false);
-  const [whisperModelLoaded, setWhisperModelLoaded] = useState(false);
-  const [whisperModelPath, setWhisperModelPath] = useState('');
   const [audioInputDevices, setAudioInputDevices] = useState([{ id: '', name: 'System default', isDefault: true }]);
   const [audioOutputDevices, setAudioOutputDevices] = useState([{ id: '', name: 'System default', isDefault: true }]);
   const [selectedAudioInputId, setSelectedAudioInputId] = useState('');
   const [selectedSystemAudioOutputId, setSelectedSystemAudioOutputId] = useState('');
   const [selectedCaptureMode, setSelectedCaptureMode] = useState('microphoneSystem');
   const [selectedLanguage, setSelectedLanguage] = useState('en');
-  const [transcriptionEngine, setTranscriptionEngine] = useState<TranscriptionEngine>('local');
+  const [transcriptionEngine, setTranscriptionEngine] = useState<TranscriptionEngine>('foundryLocal');
   const [azureEndpoint, setAzureEndpoint] = useState('');
   const [azureTenantId, setAzureTenantId] = useState('');
   const [azureSubscriptionId, setAzureSubscriptionId] = useState('');
@@ -181,6 +233,12 @@ export default function App() {
   const [fastTranscriptionFile, setFastTranscriptionFile] = useState<FastTranscriptionFile | null>(null);
   const [fastTranscriptionProgress, setFastTranscriptionProgress] = useState<FastTranscriptionProgress | null>(null);
   const [fastTranscribing, setFastTranscribing] = useState(false);
+  const [fastLanguage, setFastLanguage] = useState('en-US');
+  const [fastUploadConsent, setFastUploadConsent] = useState(false);
+  const [fastDiarization, setFastDiarization] = useState(false);
+  const [retranscribeSourceId, setRetranscribeSourceId] = useState<string | null>(null);
+  const [assistantExpanded, setAssistantExpanded] = useState(false);
+  const [recordingOperationBusy, setRecordingOperationBusy] = useState(false);
   const [refreshingMeetings, setRefreshingMeetings] = useState(false);
   const [refreshingVideos, setRefreshingVideos] = useState(false);
   const [videos, setVideos] = useState<VideoRecording[]>([]);
@@ -194,16 +252,160 @@ export default function App() {
   const [screenAudioCaptureMode, setScreenAudioCaptureMode] = useState('microphoneSystem');
   const [screenAudioLevels, setScreenAudioLevels] = useState<ScreenAudioLevels>({ microphone: 0, system: 0, mixed: 0 });
   const [screenProcessingStatus, setScreenProcessingStatus] = useState<ScreenProcessingStatus | null>(null);
+  const [foundryLocalModels, setFoundryLocalModels] = useState<FoundryLocalModelCatalogEntry[]>([]);
+  const [foundryLocalModelAlias, setFoundryLocalModelAlias] = useState('');
+  const [foundryLocalChunkingMode, setFoundryLocalChunkingMode] =
+    useState<FoundryLocalChunkingMode>('utterance');
+  const [foundryLocalLanguage, setFoundryLocalLanguage] = useState('en');
+  const [foundryLoadingModels, setFoundryLoadingModels] = useState(false);
+  const [foundryDownloadingAlias, setFoundryDownloadingAlias] = useState<string | null>(null);
+  const [foundryDownloadProgress, setFoundryDownloadProgress] = useState<FoundryDownloadProgress | null>(null);
 
   const elapsedTimerRef = useRef<number | null>(null);
   const screenElapsedTimerRef = useRef<number | null>(null);
   const activeScreenVideoIdRef = useRef<string | null>(null);
   const activeMeetingIdRef = useRef<string | null>(null);
+  const latestMicrophoneMuteRef = useRef<{ meetingId: string; muted: boolean } | null>(null);
   const elapsedSecondsRef = useRef(0);
   const transcriptListRef = useRef<HTMLDivElement | null>(null);
-  const azureSessionRef = useRef<AzureSpeechSession | null>(null);
-  const audioChunkCleanupRef = useRef<(() => void) | null>(null);
+  const recordingMeetingIdRef = useRef<string | null>(null);
+  const azurePipeRef = useRef<AzureRecordingPipe | null>(null);
+  const recordingQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const recordingOperationsRef = useRef(0);
+  const fastTranscribingRef = useRef(false);
+  const fastConsentRef = useRef<{ file: FastTranscriptionFile; meetingId: string | null } | null>(null);
+  const stopRecordingPromiseRef = useRef<Promise<void> | null>(null);
+  const recordingAttemptRef = useRef<RecordingAttempt | null>(null);
+  const recordingListenersReadyRef = useRef<Promise<void>>(Promise.resolve());
   const settingsLoadedRef = useRef(false);
+
+  function beginRecordingAttempt(): RecordingAttempt {
+    const attempt: RecordingAttempt = { meetingId: null, pendingErrors: new Map(), failure: null };
+    recordingAttemptRef.current = attempt;
+    return attempt;
+  }
+
+  function surfaceRecordingFailure(attempt: RecordingAttempt) {
+    if (!attempt.failure || recordingAttemptRef.current !== attempt) return;
+    const { message, recordingPath } = attempt.failure;
+    const recovery = `${message} Capture stopped. Recovery WAV: ${recordingPath}. No recovery audio has been uploaded automatically.`;
+    setError((current) => current?.includes(recovery) ? current : current ? `${current} ${recovery}` : recovery);
+  }
+
+  function receiveRecordingFailure(event: NativeRecordingErrorEvent) {
+    const attempt = recordingAttemptRef.current;
+    if (!attempt || !event.fatal || attempt.failure) return;
+    if (!attempt.meetingId) {
+      // Native can fail before start_recording returns the new meeting ID.
+      attempt.pendingErrors.set(event.meetingId, event);
+      return;
+    }
+    if (event.meetingId !== attempt.meetingId) return;
+    // A user Stop may already have cleared the native ID while Azure/local
+    // persistence cleanup is still running. Retain a concurrent failure too.
+    if (recordingMeetingIdRef.current !== event.meetingId && !stopRecordingPromiseRef.current) return;
+    attempt.failure = event;
+    stopTimers();
+    surfaceRecordingFailure(attempt);
+    // Do not await from inside startup: stop is serialized behind that operation.
+    // The failure latch and the shared stop promise coalesce repeated events and
+    // a simultaneous user Stop without starting a cloud recovery/transcription.
+    void handleStopRecording(attempt).catch(() => surfaceRecordingFailure(attempt));
+  }
+
+  function identifyRecordingAttempt(attempt: RecordingAttempt, meetingId: string) {
+    if (recordingAttemptRef.current !== attempt) return;
+    attempt.meetingId = meetingId;
+    const pending = attempt.pendingErrors.get(meetingId);
+    attempt.pendingErrors.clear();
+    if (pending) receiveRecordingFailure(pending);
+  }
+
+  function revokeFastConsent() {
+    fastConsentRef.current = null;
+    setFastUploadConsent(false);
+  }
+
+  function enqueueRecordingOperation(action: () => Promise<void>): Promise<void> {
+    recordingOperationsRef.current += 1;
+    setRecordingOperationBusy(true);
+    const operation = recordingQueueRef.current.then(action);
+    // A failed operation must not poison subsequent stop/retry requests.
+    const settled = operation.catch(() => undefined).finally(() => {
+      recordingOperationsRef.current -= 1;
+      setRecordingOperationBusy(recordingOperationsRef.current > 0);
+    });
+    recordingQueueRef.current = settled;
+    return operation;
+  }
+
+  function flushAzureChunks(pipe: AzureRecordingPipe) {
+    if (!pipe.session || !pipe.meetingId || pipe.closed) return;
+    const chunks = pipe.chunks;
+    pipe.chunks = [];
+    pipe.bufferedChars = 0;
+    for (const chunk of chunks) {
+      if (chunk.meetingId === pipe.meetingId) {
+        pipe.session.pushPcmBase64(chunk.pcmBase64, chunk.offsetSeconds);
+      }
+    }
+  }
+
+  async function listenForAzureAudio(meetingId: string | null): Promise<AzureRecordingPipe> {
+    const pipe: AzureRecordingPipe = {
+      meetingId, session: null, chunks: [], bufferedChars: 0, cleanup: null, closed: false,
+    };
+    pipe.cleanup = await onAudioChunk((chunk) => {
+      if (pipe.closed || (pipe.meetingId && chunk.meetingId !== pipe.meetingId)) return;
+      try {
+        if (pipe.session && pipe.meetingId) {
+          pipe.session.pushPcmBase64(chunk.pcmBase64, chunk.offsetSeconds);
+          return;
+        }
+        pipe.chunks.push(chunk);
+        pipe.bufferedChars += chunk.pcmBase64.length;
+        let overflow = false;
+        while (pipe.bufferedChars > MAX_AZURE_BUFFER_CHARS || pipe.chunks.length > MAX_AZURE_BUFFER_CHUNKS) {
+          pipe.bufferedChars -= pipe.chunks.shift()!.pcmBase64.length;
+          overflow = true;
+        }
+        if (overflow) setError('Azure transcription buffer is full. Older pending audio was omitted from live transcription; the local recording is preserved. Stop and retranscribe the saved audio to recover it.');
+      } catch (audioError) {
+        setError(getErrorMessage(audioError, 'Could not deliver audio to Azure Speech. The local recording is preserved.'));
+      }
+    });
+    azurePipeRef.current = pipe;
+    return pipe;
+  }
+
+  function createAzureSession(meetingId: string, language: string, connection: {
+    endpoint: string; tenantId?: string; subscriptionId?: string;
+  }) {
+    return startAzureSpeechSession({
+      ...connection,
+      language: normalizeAzureLanguage(language),
+      onPartialText: setAzurePartialText,
+      onFinalText: async (text, offsetSeconds) => {
+        // The SDK already maps PCM anchors to ABSOLUTE saved-audio offsets.
+        await addNativeTranscriptSegment(meetingId, text, offsetSeconds);
+        setAzurePartialText('');
+      },
+      onError: setError,
+    });
+  }
+
+  async function closeAzurePipe(pipe: AzureRecordingPipe | null) {
+    if (!pipe) return;
+    pipe.closed = true;
+    pipe.cleanup?.();
+    pipe.cleanup = null;
+    const session = pipe.session;
+    pipe.session = null;
+    pipe.chunks = [];
+    pipe.bufferedChars = 0;
+    if (azurePipeRef.current === pipe) azurePipeRef.current = null;
+    await session?.stop();
+  }
 
   const settingsSnapshot = (overrides: Partial<AppSettings> = {}): AppSettings => ({
     transcriptionEngine,
@@ -216,6 +418,9 @@ export default function App() {
     azureTenantId,
     azureSubscriptionId,
     azureLanguage,
+    foundryLocalModelAlias,
+    foundryLocalLanguage,
+    foundryLocalChunkingMode,
     videoOutputFolder,
     videoCodec,
     ffmpegPath,
@@ -226,6 +431,14 @@ export default function App() {
     () => meetings.find((meeting) => meeting.id === activeMeetingId) ?? null,
     [activeMeetingId, meetings],
   );
+
+  const meetingSpeakers = useMemo(() => {
+    const speakers = new Map<string, string>();
+    for (const segment of activeMeeting?.transcript ?? []) {
+      if (segment.speakerId) speakers.set(segment.speakerId, segment.speakerName || '');
+    }
+    return [...speakers].map(([id, name]) => ({ id, name }));
+  }, [activeMeeting]);
 
   const filteredMeetings = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
@@ -243,8 +456,16 @@ export default function App() {
   }, [activeMeeting]);
 
   useEffect(() => {
+    let disposed = false;
+    // Queue restore-time events even while the listener registrations and
+    // runtime identity lookup are still pending.
+    const restoredAttempt = beginRecordingAttempt();
     const load = async () => {
       try {
+        if (disposed) return;
+        await recordingListenersReadyRef.current;
+        if (disposed) return;
+        const attempt = restoredAttempt;
         const storedMeetings = await fetchMeetings();
         setMeetings(storedMeetings);
         setVideos(await refreshVideos());
@@ -255,9 +476,7 @@ export default function App() {
         }
         const storedSettings = await getNativeSettings();
         if (storedSettings) {
-          if (storedSettings.transcriptionEngine === 'local' || storedSettings.transcriptionEngine === 'azure') {
-            setTranscriptionEngine(storedSettings.transcriptionEngine);
-          }
+          setTranscriptionEngine(migrateTranscriptionEngine(storedSettings.transcriptionEngine));
           if (storedSettings.captureMode) setSelectedCaptureMode(storedSettings.captureMode);
           if (storedSettings.screenAudioCaptureMode) {
             setScreenAudioCaptureMode(storedSettings.screenAudioCaptureMode);
@@ -266,14 +485,21 @@ export default function App() {
           }
           if (storedSettings.audioDeviceId) setSelectedAudioInputId(storedSettings.audioDeviceId);
           if (storedSettings.systemAudioDeviceId) setSelectedSystemAudioOutputId(storedSettings.systemAudioDeviceId);
-          if (storedSettings.language) setSelectedLanguage(storedSettings.language);
+          if (storedSettings.language) setSelectedLanguage(normalizeFoundryLanguage(storedSettings.language));
           if (storedSettings.azureEndpoint) setAzureEndpoint(storedSettings.azureEndpoint);
           if (storedSettings.azureTenantId) setAzureTenantId(storedSettings.azureTenantId);
           if (storedSettings.azureSubscriptionId) setAzureSubscriptionId(storedSettings.azureSubscriptionId);
-          if (storedSettings.azureLanguage) setAzureLanguage(storedSettings.azureLanguage);
+          if (storedSettings.azureLanguage) setAzureLanguage(normalizeAzureLanguage(storedSettings.azureLanguage));
           if (storedSettings.videoOutputFolder) setVideoOutputFolder(storedSettings.videoOutputFolder);
           if (storedSettings.videoCodec === 'h265' || storedSettings.videoCodec === 'h264') setVideoCodec(storedSettings.videoCodec);
           if (storedSettings.ffmpegPath) setFfmpegPath(storedSettings.ffmpegPath);
+          if (storedSettings.foundryLocalModelAlias) setFoundryLocalModelAlias(storedSettings.foundryLocalModelAlias);
+          setFoundryLocalChunkingMode(
+            storedSettings.foundryLocalChunkingMode === 'fixed5Seconds'
+              ? 'fixed5Seconds'
+              : 'utterance'
+          );
+          if (storedSettings.foundryLocalLanguage) setFoundryLocalLanguage(normalizeFoundryLanguage(storedSettings.foundryLocalLanguage));
         }
         void checkAzureCliSignIn(
           storedSettings?.azureTenantId?.trim() || undefined,
@@ -281,54 +507,56 @@ export default function App() {
         )
           .then((status) => setAzureCliStatus(status))
           .catch(() => undefined);
-        const modelStatus = await getWhisperModelStatus();
-        setWhisperModelLoaded(modelStatus.loaded);
-        if (modelStatus.path) {
-          setWhisperModelPath(modelStatus.path);
-          if (!modelStatus.loaded) {
-            void ensureWhisperModelLoaded(modelStatus.path, false);
-          }
-        }
         const devices = await listNativeAudioInputDevices();
         setAudioInputDevices(devices.length > 0 ? devices : [{ id: '', name: 'System default', isDefault: true }]);
         const outputDevices = await listNativeAudioOutputDevices();
         setAudioOutputDevices(outputDevices.length > 0 ? outputDevices : [{ id: '', name: 'System default', isDefault: true }]);
         const runtimeStatus = await getRecordingRuntimeStatus();
+        if (disposed) return;
         if (runtimeStatus.audioRecordingActive && runtimeStatus.audioMeetingId) {
-          const restoredElapsed = Math.floor(runtimeStatus.audioElapsedSeconds);
+          const activeRecording = storedMeetings.find((meeting) => meeting.id === runtimeStatus.audioMeetingId);
+          const restoredElapsed = Math.floor(
+            (activeRecording?.durationSeconds ?? 0) + runtimeStatus.audioElapsedSeconds
+          );
           activeMeetingIdRef.current = runtimeStatus.audioMeetingId;
+          recordingMeetingIdRef.current = runtimeStatus.audioMeetingId;
           setActiveMeetingId(runtimeStatus.audioMeetingId);
           setElapsedSeconds(restoredElapsed);
           elapsedSecondsRef.current = restoredElapsed;
+          latestMicrophoneMuteRef.current = {
+            meetingId: runtimeStatus.audioMeetingId,
+            muted: runtimeStatus.audioMicrophoneMuted,
+          };
+          setMicrophoneMuted(runtimeStatus.audioMicrophoneMuted);
           setStatus('recording');
           if (!elapsedTimerRef.current) startTimers();
+          identifyRecordingAttempt(attempt, runtimeStatus.audioMeetingId);
 
-          const activeRecording = storedMeetings.find((meeting) => meeting.id === runtimeStatus.audioMeetingId);
-          if (activeRecording?.transcriptionEngine === 'azure' && storedSettings?.azureEndpoint?.trim()) {
+          if (!attempt.failure && activeRecording?.transcriptionEngine === 'azure' && storedSettings?.azureEndpoint?.trim()) {
             try {
-              const azureSession = await startAzureSpeechSession({
-                endpoint: storedSettings.azureEndpoint.trim(),
-                tenantId: storedSettings.azureTenantId?.trim() || undefined,
-                subscriptionId: storedSettings.azureSubscriptionId?.trim() || undefined,
-                language: activeRecording.language || storedSettings.azureLanguage?.trim() || 'en-US',
-                onPartialText: setAzurePartialText,
-                onFinalText: async (text, offsetSeconds) => {
-                  const meetingId = activeMeetingIdRef.current;
-                  if (meetingId) await addNativeTranscriptSegment(meetingId, text, offsetSeconds);
-                },
-                onError: setError,
-              });
-              azureSessionRef.current = azureSession;
-              audioChunkCleanupRef.current = await onAudioChunk((event) => {
-                if (event.meetingId === activeMeetingIdRef.current) {
-                  azureSessionRef.current?.pushPcmBase64(event.pcmBase64);
-                }
-              });
+              const meetingId = runtimeStatus.audioMeetingId;
+              const pipe = await listenForAzureAudio(meetingId);
+              if (disposed) return;
+              if (!attempt.failure) {
+                pipe.session = await createAzureSession(meetingId, activeRecording.language || storedSettings.azureLanguage || 'en-US', {
+                  endpoint: storedSettings.azureEndpoint.trim(),
+                  tenantId: storedSettings.azureTenantId?.trim() || undefined,
+                  subscriptionId: storedSettings.azureSubscriptionId?.trim() || undefined,
+                });
+              }
+              if (disposed) await closeAzurePipe(pipe);
+              else if (!attempt.failure) flushAzureChunks(pipe);
             } catch (azureError) {
               setError(getErrorMessage(azureError, 'Recording restored, but Azure live transcription could not reconnect.'));
             }
+          } else if (!attempt.failure && activeRecording?.transcriptionEngine === 'azure') {
+            await listenForAzureAudio(runtimeStatus.audioMeetingId);
+            setError('Recording restored locally, but Azure transcription needs a Speech endpoint. Stop and configure Azure, then retranscribe the saved audio.');
           }
+        } else if (recordingAttemptRef.current === attempt) {
+          recordingAttemptRef.current = null;
         }
+        if (disposed) return;
         if (runtimeStatus.screenRecordingActive && runtimeStatus.screenVideoId) {
           activeScreenVideoIdRef.current = runtimeStatus.screenVideoId;
           setScreenElapsedSeconds(Math.floor(runtimeStatus.screenElapsedSeconds));
@@ -340,34 +568,100 @@ export default function App() {
             );
           }
         }
+        listFoundryLocalModels()
+          .then((foundryModels) => {
+            setFoundryLocalModels(foundryModels);
+            if (!storedSettings?.foundryLocalModelAlias && foundryModels.length > 0) {
+              setFoundryLocalModelAlias(foundryModels.find((model) => model.cached)?.alias ?? foundryModels[0].alias);
+            }
+          })
+          .catch(() => undefined);
       } catch (loadError) {
         setError(loadError instanceof Error ? loadError.message : 'Tauri backend is not available.');
       } finally {
-        settingsLoadedRef.current = true;
+        if (!disposed) settingsLoadedRef.current = true;
       }
     };
 
-    load();
+    void enqueueRecordingOperation(load);
 
-    let unlisten: (() => void) | undefined;
-    onTranscriptSegment(({ meetingId, segment }) => {
-      setMeetings((current) => {
-        const target = current.find((meeting) => meeting.id === meetingId);
-        if (!target) {
-          return current;
-        }
-        return upsertMeeting(current, {
-          ...target,
-          transcript: [...target.transcript, segment],
-          updatedAt: new Date().toISOString(),
+    const cleanups = new Set<() => void>();
+    const registrations: Promise<void>[] = [];
+    const registerListener = (listener: Promise<() => void>) => {
+      const registration = listener
+        .then((cleanup) => {
+          if (disposed) {
+            cleanup();
+          } else {
+            cleanups.add(cleanup);
+          }
+        })
+        .catch((listenerError) => {
+          if (!disposed) {
+            setError(listenerError instanceof Error ? listenerError.message : 'Failed to register a native event listener.');
+          }
+          throw listenerError;
         });
-      });
-    }).then((cleanup) => {
-      unlisten = cleanup;
-    });
+      registrations.push(registration);
+    };
+    registerListener(
+      onTranscriptSegment(({ meetingId, segment }) => {
+        if (disposed) {
+          return;
+        }
+        setMeetings((current) => {
+          const target = current.find((meeting) => meeting.id === meetingId);
+          if (!target || target.transcript.some((item) => item.id === segment.id)) {
+            return current;
+          }
+          return upsertMeeting(current, {
+            ...target,
+            transcript: [...target.transcript, segment],
+            updatedAt: new Date().toISOString(),
+          });
+        });
+      }),
+    );
+    registerListener(
+      onFoundryDownloadProgress((progress) => {
+        if (disposed) {
+          return;
+        }
+        setFoundryDownloadProgress(progress);
+        if (progress.phase === 'done' || progress.phase === 'error') {
+          setFoundryDownloadingAlias(null);
+        }
+      }),
+    );
+    registerListener(
+      onMicrophoneMuteChanged(({ meetingId, muted }) => {
+        latestMicrophoneMuteRef.current = { meetingId, muted };
+        if (!disposed && meetingId === recordingMeetingIdRef.current) {
+          setMicrophoneMuted(muted);
+        }
+      }),
+    );
+    registerListener(
+      onCallMuteWarning(({ message }) => {
+        if (!disposed) {
+          setCallMuteWarning(message);
+        }
+      }),
+    );
+    registerListener(onRecordingError((event) => {
+      if (!disposed) receiveRecordingFailure(event);
+    }));
+    registerListener(onTranscriptionError((message) => {
+      if (!disposed) setError(message);
+    }));
+    recordingListenersReadyRef.current = Promise.all(registrations).then(() => undefined);
+    // Start must still observe a registration failure even if no one records.
+    void recordingListenersReadyRef.current.catch(() => undefined);
 
     return () => {
-      unlisten?.();
+      disposed = true;
+      cleanups.forEach((cleanup) => cleanup());
+      cleanups.clear();
     };
   }, []);
 
@@ -410,6 +704,10 @@ export default function App() {
     activeMeetingIdRef.current = activeMeetingId;
   }, [activeMeetingId]);
 
+  useEffect(() => {
+    revokeFastConsent();
+  }, [fastTranscriptionFile, activeMeetingId, retranscribeSourceId]);
+
   // Persist settings whenever they change. Debounced so per-keystroke edits in
   // the Azure fields do not rewrite the store on every character. Skipped until
   // the initial load has applied any stored values, so defaults never clobber
@@ -435,6 +733,9 @@ export default function App() {
     azureTenantId,
     azureSubscriptionId,
     azureLanguage,
+    foundryLocalModelAlias,
+    foundryLocalChunkingMode,
+    foundryLocalLanguage,
     videoOutputFolder,
     videoCodec,
     ffmpegPath,
@@ -453,8 +754,12 @@ export default function App() {
         window.clearInterval(elapsedTimerRef.current);
       }
       if (screenElapsedTimerRef.current) window.clearInterval(screenElapsedTimerRef.current);
-      audioChunkCleanupRef.current?.();
-      void azureSessionRef.current?.stop();
+      // Cleanup follows any in-flight setup; never close a replacement session
+      // from a stale async completion (including React StrictMode remounts).
+      void enqueueRecordingOperation(async () => {
+        stopTimers();
+        await closeAzurePipe(azurePipeRef.current);
+      }).catch(() => undefined);
     };
   }, []);
 
@@ -466,33 +771,6 @@ export default function App() {
       }
       return upsertMeeting(current, updater(target));
     });
-  };
-
-  const ensureWhisperModelLoaded = async (modelPath: string, showErrors: boolean) => {
-    const trimmedPath = modelPath.trim();
-    if (!trimmedPath) {
-      if (showErrors) {
-        setError('Enter the full path to a local Whisper .bin model file.');
-      }
-      return false;
-    }
-
-    if (whisperModelLoaded && whisperModelPath === trimmedPath) {
-      return true;
-    }
-
-    try {
-      await loadWhisperModel(trimmedPath);
-      setWhisperModelPath(trimmedPath);
-      setWhisperModelLoaded(true);
-      return true;
-    } catch (modelError) {
-      setWhisperModelLoaded(false);
-      if (showErrors) {
-        setError(modelError instanceof Error ? modelError.message : String(modelError));
-      }
-      return false;
-    }
   };
 
   const tenantForAzureCli = () => azureTenantId.trim() || undefined;
@@ -533,11 +811,12 @@ export default function App() {
         elapsedSecondsRef.current = next;
         return next;
       });
-      updateActiveMeeting((meeting) => ({
+      const meetingId = recordingMeetingIdRef.current;
+      setMeetings((current) => current.map((meeting) => meeting.id === meetingId ? {
         ...meeting,
         durationSeconds: meeting.durationSeconds + 1,
         updatedAt: new Date().toISOString(),
-      }));
+      } : meeting));
     }, 1000);
   };
 
@@ -548,101 +827,101 @@ export default function App() {
     }
   };
 
-  const handleStartRecording = async (appendToMeetingId?: string) => {
-    setError(null);
+  const handleStartRecording = (appendToMeetingId?: string): Promise<void> => {
+    // Acquire synchronously: React state alone cannot guard rapid double clicks.
+    if (recordingOperationsRef.current || recordingMeetingIdRef.current || fastTranscribingRef.current) return Promise.resolve();
     setStatus('starting');
-    setShowRecordingList(false);
-    setAzurePartialText('');
-    const appendOffsetSeconds = appendToMeetingId === activeMeeting?.id
-      ? activeMeeting?.durationSeconds ?? 0
-      : 0;
-    let azureSession: AzureSpeechSession | null = null;
-    let audioChunkCleanup: (() => void) | null = null;
-    try {
-      // Trigger the same load path as the "Load Model" button so the Whisper
-      // model is ready without a manual step. If no path is configured yet, ask
-      // the backend for an auto-detected model. Loading here is best-effort: the
-      // backend also auto-loads/detects a model when recording starts, so we do
-      // not block on a frontend load failure.
-      if (transcriptionEngine === 'local') {
-        let modelPath = whisperModelPath.trim();
-        if (!modelPath) {
-          const status = await getWhisperModelStatus();
-          if (status.path) {
-            modelPath = status.path;
-            setWhisperModelPath(status.path);
-          }
+    return enqueueRecordingOperation(async () => {
+      setError(null);
+      setShowRecordingList(false);
+      setAzurePartialText('');
+      setMicrophoneMuted(false);
+      setCallMuteWarning(null);
+      const existing = meetings.find((meeting) => meeting.id === appendToMeetingId);
+      // Continue the meeting's live engine; file-transcribed meetings use Azure
+      // live recognition when appended, not an unrelated global default.
+      const engine = existing
+        ? existing.transcriptionEngine?.startsWith('azure') ? 'azure' : 'foundryLocal'
+        : transcriptionEngine;
+      const language = engine === 'azure'
+        ? normalizeAzureLanguage(existing?.language || azureLanguage)
+        : normalizeFoundryLanguage(existing?.language || foundryLocalLanguage || selectedLanguage);
+      let pipe: AzureRecordingPipe | null = null;
+      const attempt = beginRecordingAttempt();
+      try {
+        await recordingListenersReadyRef.current;
+        if (appendToMeetingId && !existing) throw new Error('The meeting to continue is no longer available.');
+        if (engine === 'azure') {
+          if (!azureEndpoint.trim()) throw new Error('Enter the Speech custom domain endpoint before recording with Azure.');
+          if (!await ensureAzureCliSignedIn()) throw new Error('Azure CLI sign-in is required before recording with Azure Speech.');
+          // Subscribe before capture starts. New recordings have no ID until IPC
+          // returns, so keep early chunks and filter them once the ID is known.
+          pipe = await listenForAzureAudio(appendToMeetingId ?? null);
+        } else if (!foundryLocalModelAlias.trim()) {
+          throw new Error('Select or download a Foundry Local speech model before recording.');
         }
-        if (modelPath) {
-          await ensureWhisperModelLoaded(modelPath, false);
-        }
-      } else {
-        const resolvedAzureEndpoint = azureEndpoint.trim();
-        if (!resolvedAzureEndpoint) {
-          throw new Error('Enter the Speech custom domain endpoint before recording with Azure.');
-        }
-        const signedIn = await ensureAzureCliSignedIn();
-        if (!signedIn) {
-          throw new Error('Azure CLI sign-in is required before recording with Azure Speech.');
-        }
-        azureSession = await startAzureSpeechSession({
-          endpoint: resolvedAzureEndpoint,
-          tenantId: tenantForAzureCli(),
-          subscriptionId: subscriptionForAzureCli(),
-          language: azureLanguage.trim() || 'en-US',
-          onPartialText: setAzurePartialText,
-          onFinalText: async (text, offsetSeconds) => {
-            const meetingId = activeMeetingIdRef.current;
-            if (meetingId) {
-              await addNativeTranscriptSegment(meetingId, text, offsetSeconds + appendOffsetSeconds);
-              setAzurePartialText('');
-            }
-          },
-          onError: setError,
+        const meeting = await startNativeRecording({
+          appendToMeetingId,
+          audioDeviceId: selectedAudioInputId,
+          systemAudioDeviceId: selectedSystemAudioOutputId,
+          captureMode: selectedCaptureMode,
+          language,
+          transcriptionEngine: engine,
+          foundryLocalModelAlias,
+          foundryLocalChunkingMode,
         });
-        audioChunkCleanup = await onAudioChunk((event) => {
-          if (event.meetingId === activeMeetingIdRef.current) {
-            azureSessionRef.current?.pushPcmBase64(event.pcmBase64);
-          }
-        });
+        recordingMeetingIdRef.current = meeting.id;
+        setMeetings((current) => upsertMeeting(current, meeting));
+        setActiveMeetingId(meeting.id);
+        activeMeetingIdRef.current = meeting.id;
+        const latestMute = latestMicrophoneMuteRef.current;
+        setMicrophoneMuted(latestMute?.meetingId === meeting.id ? latestMute.muted : false);
+        setElapsedSeconds(meeting.durationSeconds);
+        elapsedSecondsRef.current = meeting.durationSeconds;
+        startTimers();
+        identifyRecordingAttempt(attempt, meeting.id);
+        if (attempt.failure) return;
+        if (pipe) {
+          pipe.meetingId = meeting.id;
+          pipe.session = await createAzureSession(meeting.id, language, {
+            endpoint: azureEndpoint.trim(), tenantId: tenantForAzureCli(), subscriptionId: subscriptionForAzureCli(),
+          });
+          if (!attempt.failure) flushAzureChunks(pipe);
+        }
+        if (!attempt.failure) setStatus('recording');
+      } catch (recordingError) {
+        const message = getErrorMessage(recordingError, 'Native recording could not start.');
+        if (attempt.failure) {
+          // Normal stop is already queued. Azure startup may fail concurrently;
+          // do not issue a second native stop from this startup error handler.
+          setError(message);
+          surfaceRecordingFailure(attempt);
+          return;
+        }
+        // Startup cleanup must use the same serialized stop as capture failures
+        // and user Stop. Never await it here: it runs after startup settles.
+        if (recordingMeetingIdRef.current) {
+          setError(message);
+          void handleStopRecording(attempt).catch(() => surfaceRecordingFailure(attempt));
+          return;
+        }
+        if (!recordingMeetingIdRef.current) {
+          stopTimers();
+          await closeAzurePipe(pipe).catch(() => undefined);
+        }
+        setStatus(recordingMeetingIdRef.current ? 'recording' : 'idle');
+        setMicrophoneMuted(false);
+        setError(message);
+      } finally {
+        if (!recordingMeetingIdRef.current && recordingAttemptRef.current === attempt && !attempt.failure) {
+          recordingAttemptRef.current = null;
+        }
       }
-      const meeting = await startNativeRecording({
-        appendToMeetingId,
-        audioDeviceId: selectedAudioInputId,
-        systemAudioDeviceId: selectedSystemAudioOutputId,
-        captureMode: selectedCaptureMode,
-        language: transcriptionEngine === 'azure' ? azureLanguage.trim() || 'en-US' : selectedLanguage,
-        transcriptionEngine,
-      });
-      azureSessionRef.current = azureSession;
-      audioChunkCleanupRef.current = audioChunkCleanup;
-      setMeetings((current) => upsertMeeting(current, meeting));
-      setActiveMeetingId(meeting.id);
-      activeMeetingIdRef.current = meeting.id;
-      setElapsedSeconds(appendOffsetSeconds);
-      elapsedSecondsRef.current = appendOffsetSeconds;
-      setStatus('recording');
-      startTimers();
-      // Reflect the model the backend actually loaded (e.g. an auto-detected one).
-      if (transcriptionEngine === 'local') {
-        getWhisperModelStatus()
-          .then((status) => {
-            setWhisperModelLoaded(status.loaded);
-            if (status.path) {
-              setWhisperModelPath(status.path);
-            }
-          })
-          .catch(() => undefined);
-      }
-    } catch (recordingError) {
-      audioChunkCleanup?.();
-      await azureSession?.stop();
-      setStatus('idle');
-      setError(getErrorMessage(recordingError, 'Native recording could not start.'));
-    }
+    });
   };
 
   const handleOpenRecordingChoice = () => {
+    if (recordingOperationsRef.current || recordingMeetingIdRef.current || fastTranscribingRef.current) return;
     setError(null);
     setShowRecordingChoice(true);
   };
@@ -661,11 +940,15 @@ export default function App() {
   };
 
   const handleSelectFastTranscriptionFile = async () => {
+    if (fastTranscribingRef.current) return;
+    revokeFastConsent();
     setError(null);
     try {
       const file = await selectFastTranscriptionAudio();
       if (file) {
         setFastTranscriptionFile(file);
+        setRetranscribeSourceId(null);
+        setFastLanguage(normalizeAzureLanguage(azureLanguage));
         setFastTranscriptionProgress(null);
       }
     } catch (selectionError) {
@@ -674,9 +957,15 @@ export default function App() {
   };
 
   const transcribeFile = async (file: FastTranscriptionFile): Promise<boolean> => {
-    if (fastTranscribing) {
+    if (fastTranscribingRef.current || recordingOperationsRef.current || recordingMeetingIdRef.current || screenStatus !== 'idle') {
       return false;
     }
+    const consent = fastConsentRef.current;
+    if (!fastUploadConsent || file !== fastTranscriptionFile || !consent || consent.file !== file || consent.meetingId !== activeMeetingId) {
+      setError('Review this file and explicitly consent to uploading its audio to Azure Speech.');
+      return false;
+    }
+    fastTranscribingRef.current = true;
     setError(null);
     setFastTranscribing(true);
     setFastTranscriptionProgress({ phase: 'validating', detail: 'Validating the selected media file.' });
@@ -688,13 +977,18 @@ export default function App() {
       if (!signedIn) {
         throw new Error('Azure CLI sign-in is required before file transcription.');
       }
+      if (fastConsentRef.current !== consent) {
+        throw new Error('The file or meeting changed while signing in. Review the file and give upload consent again.');
+      }
       const meeting = await transcribeFastAudio(
         file.path,
-        file.name.replace(/\.[^.]+$/, ''),
-        azureLanguage.trim() || 'en-US',
+        file.name.replace(/\.(wav|mp3|mp4)$/i, ''),
+        normalizeAzureLanguage(fastLanguage),
         azureEndpoint,
         tenantForAzureCli(),
         subscriptionForAzureCli(),
+        true,
+        fastDiarization,
       );
       setMeetings((current) => upsertMeeting(current, meeting));
       setActiveMeetingId(meeting.id);
@@ -704,7 +998,9 @@ export default function App() {
       setError(getErrorMessage(transcriptionError, 'Azure Speech file transcription failed.'));
       return false;
     } finally {
+      fastTranscribingRef.current = false;
       setFastTranscribing(false);
+      revokeFastConsent();
     }
   };
 
@@ -716,31 +1012,78 @@ export default function App() {
       setShowBatchTranscription(false);
       setShowRecordingList(false);
       setFastTranscriptionFile(null);
+      setRetranscribeSourceId(null);
     }
   };
 
-  const handleStopRecording = async () => {
-    setStatus('saving');
-    stopTimers();
-    try {
-      const meeting = await stopNativeRecording();
-      audioChunkCleanupRef.current?.();
-      audioChunkCleanupRef.current = null;
-      await azureSessionRef.current?.stop();
-      azureSessionRef.current = null;
-      setAzurePartialText('');
-      setMeetings((current) => upsertMeeting(current, meeting));
-      setStatus('idle');
-    } catch (stopError) {
-      setError(stopError instanceof Error ? stopError.message : 'Failed to stop recording.');
-      audioChunkCleanupRef.current?.();
-      audioChunkCleanupRef.current = null;
-      await azureSessionRef.current?.stop();
-      azureSessionRef.current = null;
-      setAzurePartialText('');
-      setStatus('idle');
-      void refreshMeetings().then(setMeetings).catch(() => undefined);
+  const handleStopRecording = (expectedAttempt = recordingAttemptRef.current): Promise<void> => {
+    if (expectedAttempt !== recordingAttemptRef.current) return Promise.resolve();
+    if (stopRecordingPromiseRef.current) {
+      return stopRecordingPromiseRef.current;
     }
+    const operation = enqueueRecordingOperation(async () => {
+      if (expectedAttempt !== recordingAttemptRef.current || !recordingMeetingIdRef.current) {
+        if (expectedAttempt) surfaceRecordingFailure(expectedAttempt);
+        return;
+      }
+      setStatus('saving');
+      stopTimers();
+      try {
+        const meeting = await stopNativeRecording();
+        recordingMeetingIdRef.current = null;
+        // Native stop waits for the last PCM emission. Only now remove the
+        // listener and close the stream; stop also awaits final transcript writes.
+        const pipe = azurePipeRef.current;
+        if (pipe?.chunks.length) setError('Some buffered audio could not be transcribed live. The saved audio can be retranscribed.');
+        await closeAzurePipe(pipe);
+        setAzurePartialText('');
+        setMicrophoneMuted(false);
+        setMeetings((current) => upsertMeeting(current, meeting));
+        // Native's stop result predates the recognizer's final persisted text.
+        const persisted = await fetchMeetings();
+        const finalMeeting = persisted.find((item) => item.id === meeting.id);
+        if (finalMeeting) setMeetings((current) => upsertMeeting(current, finalMeeting));
+        setStatus('idle');
+      } catch (stopError) {
+        let message = stopError instanceof Error ? stopError.message : 'Failed to stop recording.';
+        // A native finalization error can occur AFTER capture has stopped.
+        // Conversely, never detach live PCM if capture really is still active.
+        if (recordingMeetingIdRef.current) {
+          try {
+            const runtime = await getRecordingRuntimeStatus();
+            if (!runtime.audioRecordingActive) recordingMeetingIdRef.current = null;
+          } catch {
+            message += ' Could not confirm capture stopped; retry Stop.';
+          }
+        }
+        if (!recordingMeetingIdRef.current || expectedAttempt?.failure) {
+          try {
+            await closeAzurePipe(azurePipeRef.current);
+          } catch (azureStopError) {
+            message = `${message} ${getErrorMessage(azureStopError, 'Azure Speech could not stop cleanly.')}`;
+          }
+        } else {
+          startTimers();
+        }
+        setAzurePartialText('');
+        setMicrophoneMuted(false);
+        setError(message);
+        setStatus(recordingMeetingIdRef.current ? 'recording' : 'idle');
+        const persisted = await fetchMeetings().catch(() => []);
+        setMeetings((current) => persisted.reduce(upsertMeeting, current));
+      } finally {
+        // Stop success and cleanup errors may both replace the UI error.
+        // Always retain the capture failure and finalized local WAV path.
+        if (expectedAttempt) surfaceRecordingFailure(expectedAttempt);
+      }
+    });
+    stopRecordingPromiseRef.current = operation;
+    void operation.finally(() => {
+      if (stopRecordingPromiseRef.current === operation) {
+        stopRecordingPromiseRef.current = null;
+      }
+    }).catch(() => undefined);
+    return operation;
   };
 
   const handleSelectArea = async () => {
@@ -916,17 +1259,41 @@ export default function App() {
       setError('This screen recording does not contain an audio track to transcribe.');
       return;
     }
-    const completed = await transcribeFile({
+    if (fastTranscribingRef.current) return;
+    revokeFastConsent();
+    setRetranscribeSourceId(null);
+    setFastLanguage(normalizeAzureLanguage(azureLanguage));
+    setFastTranscriptionProgress(null);
+    setFastTranscriptionFile({
       path: video.videoPath,
       name: video.title,
       sizeBytes: 0,
       durationSeconds: video.durationSeconds,
       requiresMp3Extraction: true,
     });
-    if (completed) {
-      setShowVideoWorkspace(false);
-      setShowRecordingList(false);
-    }
+    setShowBatchTranscription(true);
+    setShowVideoWorkspace(false);
+    setShowRecordingList(false);
+  };
+
+  const handleRetranscribeMeeting = (meeting: Meeting) => {
+    if (!meeting.recordingPath || status !== 'idle' || recordingOperationsRef.current || fastTranscribingRef.current) return;
+    revokeFastConsent();
+    setFastTranscriptionProgress(null);
+    setRetranscribeSourceId(meeting.id);
+    setFastLanguage(normalizeAzureLanguage(meeting.language));
+    setFastTranscriptionFile({
+      path: meeting.recordingPath,
+      name: `${meeting.title} (retranscribed)`,
+      sizeBytes: 0, // Backend probes and validates the actual saved file.
+      durationSeconds: meeting.durationSeconds,
+      requiresMp3Extraction: /\.mp4$/i.test(meeting.recordingPath),
+    });
+    setShowBatchTranscription(true);
+    setShowVideoWorkspace(false);
+    setShowSettings(false);
+    setShowRecordingList(false);
+    setError(null);
   };
 
   const handleDeleteVideo = async (videoId: string) => {
@@ -953,7 +1320,8 @@ export default function App() {
     if (meetingId === activeMeetingId) {
       return;
     }
-    if (status === 'recording' || status === 'saving') {
+    revokeFastConsent();
+    if (status !== 'idle' || recordingMeetingIdRef.current || recordingOperationsRef.current) {
       setPendingMeetingId(meetingId);
       return;
     }
@@ -971,7 +1339,7 @@ export default function App() {
       return;
     }
     await handleStopRecording();
-    setActiveMeetingId(targetId);
+    if (!recordingMeetingIdRef.current) setActiveMeetingId(targetId);
   };
 
   const handleExportAudio = async (meeting: Meeting) => {
@@ -1045,6 +1413,34 @@ export default function App() {
     }
   };
 
+  const handleAssistantSeek = async (meeting: Meeting, offsetSeconds: number) => {
+    try {
+      if (!meeting.hasAudio) throw new Error('No saved audio is available for this source.');
+      await playNativeRecording(meeting.id, offsetSeconds);
+      const segment = meeting.transcript.find((item) => item.offsetSeconds === offsetSeconds);
+      markPlaybackActive(meeting.id, segment?.id ?? null);
+      setError(null);
+    } catch (playbackError) {
+      setError(getErrorMessage(playbackError, 'Failed to play the assistant source.'));
+    }
+  };
+
+  const handleRenameSpeaker = async (meeting: Meeting, speakerId: string, name: string) => {
+    try {
+      const updated = await renameNativeSpeaker(meeting.id, speakerId, name.trim());
+      const renamed = updated.transcript.find((segment) => segment.speakerId === speakerId);
+      setMeetings((current) => current.map((item) => item.id === meeting.id ? {
+        ...item,
+        updatedAt: updated.updatedAt,
+        transcript: item.transcript.map((segment) => segment.speakerId === speakerId
+          ? { ...segment, speakerName: renamed?.speakerName } : segment),
+      } : item));
+      setError(null);
+    } catch (renameError) {
+      setError(getErrorMessage(renameError, 'Could not save the speaker name.'));
+    }
+  };
+
   const handleDeleteMeeting = async (meetingId: string) => {
     await deleteNativeMeeting(meetingId);
     setMeetings((current) => current.filter((meeting) => meeting.id !== meetingId));
@@ -1057,20 +1453,44 @@ export default function App() {
     }
   };
 
-  const handleLoadWhisperModel = async () => {
-    setError(null);
-    await ensureWhisperModelLoaded(whisperModelPath, true);
-  };
-
-  const handleBrowseWhisperModel = async () => {
+  const handleRefreshFoundryModels = async () => {
+    setFoundryLoadingModels(true);
     setError(null);
     try {
-      const selectedPath = await selectWhisperModel();
-      if (selectedPath) {
-        setWhisperModelPath(selectedPath);
+      const models = await listFoundryLocalModels();
+      setFoundryLocalModels(models);
+      if (!models.some((model) => model.alias === foundryLocalModelAlias)) {
+        setFoundryLocalModelAlias(models.find((model) => model.cached)?.alias ?? models[0]?.alias ?? '');
       }
-    } catch (dialogError) {
-      setError(dialogError instanceof Error ? dialogError.message : String(dialogError));
+    } catch (foundryError) {
+      setError(getErrorMessage(foundryError, 'Failed to load Foundry Local models.'));
+    } finally {
+      setFoundryLoadingModels(false);
+    }
+  };
+
+  const handleDownloadFoundryModel = async () => {
+    const alias = foundryLocalModelAlias.trim();
+    if (!alias) {
+      setError('Select a Foundry Local speech model first.');
+      return;
+    }
+    setError(null);
+    setFoundryDownloadingAlias(alias);
+    setFoundryDownloadProgress({ alias, phase: 'model', percent: 0 });
+    try {
+      await downloadFoundryLocalModel(alias);
+      await handleRefreshFoundryModels();
+    } catch (foundryError) {
+      setFoundryDownloadProgress({
+        alias,
+        phase: 'error',
+        percent: 0,
+        message: getErrorMessage(foundryError, 'Foundry Local model download failed.'),
+      });
+      setError(getErrorMessage(foundryError, 'Foundry Local model download failed.'));
+    } finally {
+      setFoundryDownloadingAlias(null);
     }
   };
 
@@ -1094,35 +1514,56 @@ export default function App() {
     }
   };
 
-  const handleSessionLanguageChange = async (meeting: Meeting, language: string) => {
-    if (meeting.transcriptionEngine === 'azure-fast') {
+  const handleSessionLanguageChange = (meeting: Meeting, value: string) => enqueueRecordingOperation(async () => {
+    const attempt = recordingAttemptRef.current;
+    if (attempt?.failure && attempt.meetingId === meeting.id) {
+      surfaceRecordingFailure(attempt);
       return;
     }
-    updateActiveMeeting((currentMeeting) => ({ ...currentMeeting, language, updatedAt: new Date().toISOString() }));
+    const language = meeting.transcriptionEngine?.startsWith('azure')
+      ? normalizeAzureLanguage(value) : normalizeFoundryLanguage(value);
+    let pipe: AzureRecordingPipe | null = null;
+    let previousSession: AzureSpeechSession | null = null;
+    let replacement: AzureSpeechSession | null = null;
+    let committed = false;
+    setError(null);
     try {
-      if (meeting.transcriptionEngine === 'azure' && status === 'recording') {
-        await azureSessionRef.current?.stop();
-        azureSessionRef.current = await startAzureSpeechSession({
-          endpoint: azureEndpoint,
-          tenantId: tenantForAzureCli(),
-          subscriptionId: subscriptionForAzureCli(),
-          language,
-          onPartialText: setAzurePartialText,
-          onFinalText: async (text, offsetSeconds) => {
-            const meetingId = activeMeetingIdRef.current;
-            if (meetingId) await addNativeTranscriptSegment(meetingId, text, offsetSeconds);
-          },
-          onError: setError,
+      if (meeting.transcriptionEngine === 'azure' && recordingMeetingIdRef.current === meeting.id) {
+        pipe = azurePipeRef.current ?? await listenForAzureAudio(meeting.id);
+        if (attempt?.failure) return;
+        previousSession = pipe.session;
+        // Do not send transition audio into a recognizer that is stopping.
+        // The listener remains attached and buffers until the replacement is ready.
+        pipe.session = null;
+        replacement = await createAzureSession(meeting.id, language, {
+          endpoint: azureEndpoint.trim(), tenantId: tenantForAzureCli(), subscriptionId: subscriptionForAzureCli(),
         });
-        setAzureLanguage(language);
       }
       const updatedMeeting = await updateNativeMeetingLanguage(meeting.id, language);
-      setMeetings((current) => upsertMeeting(current, updatedMeeting));
-      setError(null);
+      committed = true;
+      // Metadata only for saved meetings. Foundry applies live changes at its
+      // utterance boundaries; neither path mutates the user's global defaults.
+      setMeetings((current) => current.map((item) => item.id === meeting.id
+        ? { ...item, language: updatedMeeting.language, updatedAt: updatedMeeting.updatedAt } : item));
+      if (pipe) {
+        await previousSession?.stop();
+        pipe.session = replacement;
+        flushAzureChunks(pipe);
+      }
+      setAzurePartialText('');
     } catch (languageError) {
-      setError(languageError instanceof Error ? languageError.message : 'Failed to change the transcription language.');
+      if (pipe) {
+        if (committed) {
+          pipe.session = replacement;
+        } else {
+          await replacement?.stop().catch(() => undefined);
+          pipe.session = previousSession;
+        }
+        try { flushAzureChunks(pipe); } catch { /* Report the original failure below. */ }
+      }
+      setError(getErrorMessage(languageError, 'Failed to change the transcription language.'));
     }
-  };
+  });
 
   const handleMiniModeChange = (
     enabled: boolean,
@@ -1157,7 +1598,12 @@ export default function App() {
               />
             </div>
           ) : (
-            <RecorderStatusDisplay className="mini-status-group" status={status} elapsedSeconds={elapsedSeconds} />
+            <RecorderStatusDisplay
+              className="mini-status-group"
+              status={status}
+              elapsedSeconds={elapsedSeconds}
+              microphoneMuted={microphoneMuted}
+            />
           )}
           <div className="mini-actions">
             {screenMiniMode ? (
@@ -1217,7 +1663,7 @@ export default function App() {
               {activeMeeting?.transcript.map((segment) => (
                 <div className="mini-transcript-row" key={segment.id}>
                   <span>{formatTimestamp(segment.offsetSeconds)}</span>
-                  <p>{segment.text}</p>
+                  <p>{segment.speakerId && <strong className="speaker-badge" style={SPEAKER_BADGE_STYLE}>{segment.speakerName || segment.speakerId}</strong>}{segment.text}</p>
                 </div>
               ))}
               {azurePartialText && (
@@ -1240,7 +1686,7 @@ export default function App() {
   }
 
   return (
-    <div className={`app-shell ${showRecordingList ? 'list-open' : ''}`}>
+    <div className={`app-shell ${showRecordingList ? 'list-open' : ''} ${assistantExpanded && activeMeeting && !showVideoWorkspace && !showBatchTranscription ? 'assistant-open' : ''}`}>
       <aside className="rail" aria-label="Primary navigation">
         <button
           className={`rail-button ${showRecordingList ? 'active' : ''}`}
@@ -1272,6 +1718,8 @@ export default function App() {
           title="Batch transcription"
           aria-label="Batch transcription"
           onClick={() => {
+            revokeFastConsent();
+            if (!fastTranscriptionFile) setFastLanguage(normalizeAzureLanguage(azureLanguage));
             setShowBatchTranscription((value) => !value);
             setShowRecordingList(false);
             setShowSettings(false);
@@ -1319,8 +1767,16 @@ export default function App() {
 
       <main className="workspace">
         <header className="topbar">
-          <RecorderStatusDisplay className="recording-state" status={status} elapsedSeconds={elapsedSeconds} />
+          <RecorderStatusDisplay
+            className="recording-state"
+            status={status}
+            elapsedSeconds={elapsedSeconds}
+            microphoneMuted={microphoneMuted}
+          />
           <div className="top-actions">
+            {activeMeeting && !showVideoWorkspace && !showBatchTranscription && <button type="button" className="text-action" aria-expanded={assistantExpanded} aria-controls="meeting-assistant-panel" onClick={() => setAssistantExpanded((expanded) => !expanded)}>
+              Copilot · GHCP
+            </button>}
             <button onClick={() => handleMiniModeChange(true)} title="Mini mode" aria-label="Mini mode">
               <Minimize2 size={16} />
             </button>
@@ -1335,6 +1791,7 @@ export default function App() {
         </header>
 
         {error && <div className="error-banner" role="status">{error}</div>}
+        {callMuteWarning && <div className="warning-banner" role="status">{callMuteWarning}</div>}
 
         {showVideoWorkspace ? (
           <ScreenRecordingWorkspace
@@ -1370,9 +1827,10 @@ export default function App() {
               <p>Upload one saved meeting file directly to Azure Speech Fast Transcription.</p>
             </div>
             <div className="batch-notice">
-              Batch transcription supports Azure Speech only. Local Whisper is unavailable in this mode.
+              Batch transcription uses Azure Speech; Foundry Local is available for live recordings.
             </div>
             <p className="batch-privacy">The selected audio is sent directly to Azure Speech. Azure Blob Storage is not used.</p>
+            {retranscribeSourceId && <p className="batch-notice">Retranscription creates a new meeting result. The original recording, transcript, language, and speaker names are left untouched.</p>}
             <button type="button" className="batch-file-button" onClick={handleSelectFastTranscriptionFile} disabled={fastTranscribing}>
               <FileAudio size={18} />
               {fastTranscriptionFile ? 'Choose another file' : 'Choose WAV, MP3, or MP4'}
@@ -1380,16 +1838,28 @@ export default function App() {
             {fastTranscriptionFile && (
               <div className="batch-file-details">
                 <strong>{fastTranscriptionFile.name}</strong>
-                <span>{formatTimestamp(fastTranscriptionFile.durationSeconds)} · {(fastTranscriptionFile.sizeBytes / 1024 / 1024).toFixed(1)} MB</span>
+                <span>{formatTimestamp(fastTranscriptionFile.durationSeconds)} · {fastTranscriptionFile.sizeBytes > 0 ? `${(fastTranscriptionFile.sizeBytes / 1024 / 1024).toFixed(1)} MB` : 'File size validated before upload'}</span>
                 <span>Estimated completion: about {Math.max(1, Math.ceil(fastTranscriptionFile.durationSeconds / 5 / 60) + 1)} minute(s)</span>
                 {fastTranscriptionFile.requiresMp3Extraction && <span>MP4 audio is extracted locally to MP3 before upload. Azure Speech does not manage this conversion.</span>}
               </div>
             )}
             <label>
               Azure Speech language
-              <select value={azureLanguage} onChange={(event) => setAzureLanguage(event.target.value)} disabled={fastTranscribing}>
+              <select value={normalizeAzureLanguage(fastLanguage)} onChange={(event) => setFastLanguage(normalizeAzureLanguage(event.target.value))} disabled={fastTranscribing}>
                 {AZURE_LANGUAGE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
               </select>
+            </label>
+            <label>
+              <input type="checkbox" checked={fastDiarization} onChange={(event) => setFastDiarization(event.target.checked)} disabled={fastTranscribing} />
+              Identify speakers (optional diarization). Labels are estimates and can be renamed after transcription.
+            </label>
+            <label>
+              <input type="checkbox" checked={fastUploadConsent} onChange={(event) => {
+                const checked = event.target.checked && Boolean(fastTranscriptionFile);
+                fastConsentRef.current = checked && fastTranscriptionFile ? { file: fastTranscriptionFile, meetingId: activeMeetingId } : null;
+                setFastUploadConsent(checked);
+              }} disabled={!fastTranscriptionFile || fastTranscribing} />
+              I explicitly consent to sending this selected file’s audio to Azure Speech for transcription.
             </label>
             {fastTranscriptionProgress && (
               <div className="batch-progress" role="status">
@@ -1397,7 +1867,7 @@ export default function App() {
                 <progress max="4" value={{ validating: 1, uploading: 2, transcribing: 3, saving: 4 }[fastTranscriptionProgress.phase]} />
               </div>
             )}
-            <button type="button" className="batch-submit" onClick={handleStartFastTranscription} disabled={!fastTranscriptionFile || fastTranscribing}>
+            <button type="button" className="batch-submit" onClick={handleStartFastTranscription} disabled={!fastTranscriptionFile || !fastUploadConsent || fastTranscribing || status !== 'idle' || screenStatus !== 'idle' || recordingOperationBusy}>
               {fastTranscribing ? 'Transcribing...' : 'Start Azure Speech transcription'}
             </button>
           </section>
@@ -1426,7 +1896,7 @@ export default function App() {
                   onChange={(event) => setTranscriptionEngine(event.target.value as TranscriptionEngine)}
                   disabled={status !== 'idle'}
                 >
-                  <option value="local">Local Whisper</option>
+                  <option value="foundryLocal">Foundry Local</option>
                   <option value="azure">Azure Speech</option>
                 </select>
               </label>
@@ -1476,17 +1946,21 @@ export default function App() {
               <label>
                 Session Language
                 <select
-                  value={transcriptionEngine === 'azure' ? azureLanguage : selectedLanguage}
+                  value={transcriptionEngine === 'azure'
+                    ? normalizeAzureLanguage(azureLanguage)
+                    : normalizeFoundryLanguage(foundryLocalLanguage)}
                   onChange={(event) => {
                     if (transcriptionEngine === 'azure') {
                       setAzureLanguage(event.target.value === 'auto' ? 'en-US' : event.target.value);
                     } else {
-                      setSelectedLanguage(event.target.value);
+                      setFoundryLocalLanguage(event.target.value === 'auto' ? 'en' : event.target.value);
                     }
                   }}
                   disabled={status !== 'idle'}
                 >
-                  {(transcriptionEngine === 'azure' ? AZURE_LANGUAGE_OPTIONS : LANGUAGE_OPTIONS).map((option) => (
+                  {(transcriptionEngine === 'azure'
+                    ? AZURE_LANGUAGE_OPTIONS
+                    : FOUNDRY_LANGUAGE_OPTIONS).map((option) => (
                     <option key={option.value} value={option.value}>{option.label}</option>
                   ))}
                 </select>
@@ -1536,29 +2010,64 @@ export default function App() {
                 {azureCliStatus?.detail && <p>{azureCliStatus.detail}</p>}
               </div>
             )}
-            {transcriptionEngine === 'local' && (
+            {transcriptionEngine === 'foundryLocal' && (
               <div className="settings-card primary">
                 <div>
-                  <h3>Transcription Model</h3>
-                  <p>Use a local ggml Whisper model. If the path is blank, Meetly tries known model folders when recording starts.</p>
+                  <h3>Foundry Local Speech Model</h3>
+                  <p>Use an on-device Foundry Local STT model. Downloading is explicit and cached for offline use.</p>
                 </div>
                 <label>
-                  Whisper Model Path
-                  <div className="path-picker-row">
-                    <input
-                      value={whisperModelPath}
-                      onChange={(event) => setWhisperModelPath(event.target.value)}
-                      placeholder="C:\\models\\ggml-base.en.bin"
-                    />
-                    <button type="button" onClick={handleBrowseWhisperModel}>Browse</button>
-                  </div>
+                  Model Alias
+                  <select
+                    value={foundryLocalModelAlias}
+                    onChange={(event) => setFoundryLocalModelAlias(event.target.value)}
+                    disabled={status !== 'idle' || foundryLoadingModels || Boolean(foundryDownloadingAlias)}
+                  >
+                    <option value="">Select a speech model</option>
+                    {foundryLocalModels.map((model) => (
+                      <option key={model.alias} value={model.alias}>
+                        {foundryModelLabel(model)}{model.cached ? ' - cached' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Chunking
+                  <select
+                    value={foundryLocalChunkingMode}
+                    onChange={(event) =>
+                      setFoundryLocalChunkingMode(event.target.value as FoundryLocalChunkingMode)
+                    }
+                    disabled={status !== 'idle'}
+                  >
+                    <option value="utterance">
+                      Utterance-based — better sentence boundaries
+                    </option>
+                    <option value="fixed5Seconds">
+                      Fixed 5 seconds — predictable updates
+                    </option>
+                  </select>
                 </label>
                 <div className="settings-action-row">
-                  <span className={`model-status ${whisperModelLoaded ? 'loaded' : ''}`}>
-                    {whisperModelLoaded ? 'Loaded' : whisperModelPath ? 'Path selected' : 'Auto-detect'}
+                  <span className={`model-status ${foundryLocalModels.find((model) => model.alias === foundryLocalModelAlias)?.cached ? 'loaded' : ''}`}>
+                    {foundryDownloadingAlias
+                      ? `${foundryDownloadProgress?.phase ?? 'model'} ${Math.round(foundryDownloadProgress?.percent ?? 0)}%`
+                      : foundryLocalModels.find((model) => model.alias === foundryLocalModelAlias)?.cached
+                        ? 'Cached'
+                        : foundryLocalModelAlias
+                          ? 'Not downloaded'
+                          : 'No model selected'}
                   </span>
-                  <button type="button" onClick={handleLoadWhisperModel}>Load selected model</button>
+                  <div className="settings-button-group">
+                    <button type="button" onClick={handleRefreshFoundryModels} disabled={status !== 'idle' || foundryLoadingModels || Boolean(foundryDownloadingAlias)}>
+                      {foundryLoadingModels ? 'Refreshing...' : 'Refresh'}
+                    </button>
+                    <button type="button" onClick={handleDownloadFoundryModel} disabled={status !== 'idle' || !foundryLocalModelAlias || Boolean(foundryDownloadingAlias)}>
+                      {foundryDownloadingAlias ? 'Downloading...' : 'Download / prepare'}
+                    </button>
+                  </div>
                 </div>
+                {foundryDownloadProgress?.message && <p>{foundryDownloadProgress.message}</p>}
               </div>
             )}
             </>}
@@ -1597,6 +2106,8 @@ export default function App() {
           </aside>
         )}
 
+        <div className={`meeting-workspace ${assistantExpanded && activeMeeting ? 'with-assistant' : ''}`}>
+        <div className="meeting-transcript-column">
         <section className="transcript-surface">
           {!activeMeeting && (
             <div className="empty-state">
@@ -1626,16 +2137,22 @@ export default function App() {
                     <label>
                       <span>Language</span>
                       <select
-                        value={activeMeeting.language ?? 'en'}
+                        value={activeMeeting.transcriptionEngine?.startsWith('azure')
+                          ? normalizeAzureLanguage(activeMeeting.language)
+                          : normalizeFoundryLanguage(activeMeeting.language)}
                         onChange={(event) => handleSessionLanguageChange(activeMeeting, event.target.value)}
-                        disabled={activeMeeting.transcriptionEngine === 'azure-fast'}
+                        disabled={recordingOperationBusy || status === 'starting' || status === 'saving' || fastTranscribing}
                       >
                         {(activeMeeting.transcriptionEngine === 'azure' || activeMeeting.transcriptionEngine === 'azure-fast' ? AZURE_LANGUAGE_OPTIONS : LANGUAGE_OPTIONS).map((option) => (
                           <option key={option.value} value={option.value}>{option.label}</option>
                         ))}
                       </select>
                     </label>
-                    {activeMeeting.transcriptionEngine === 'azure-fast' && <span>Language is fixed after file submission.</span>}
+                    <span>{status === 'recording'
+                      ? activeMeeting.transcriptionEngine === 'azure'
+                        ? 'Changes apply to upcoming audio; pending audio is buffered during reconnect.'
+                        : 'Changes apply at the next utterance boundary.'
+                      : 'Saved language is metadata for future recordings. Existing text changes only with a new transcription.'}</span>
                   </div>
                 </div>
                 <div className="meeting-actions">
@@ -1651,11 +2168,37 @@ export default function App() {
                   <button onClick={() => handleOpenMeetingFolder(activeMeeting)} title="Open local folder">
                     <FolderOpen size={16} />
                   </button>
-                  <button onClick={() => handleDeleteMeeting(activeMeeting.id)} title="Delete meeting">
+                  <button type="button" className="text-action" onClick={() => handleRetranscribeMeeting(activeMeeting)} disabled={!activeMeeting.hasAudio || !activeMeeting.recordingPath || status !== 'idle' || screenStatus !== 'idle' || fastTranscribing || recordingOperationBusy} title="Retranscribe saved audio into a new meeting" aria-label="Retranscribe saved audio">
+                    <RefreshCw size={16} />
+                    Retranscribe
+                  </button>
+                  <button onClick={() => handleDeleteMeeting(activeMeeting.id)} disabled={status !== 'idle' || recordingOperationBusy || fastTranscribing} title="Delete meeting">
                     <Trash2 size={16} />
                   </button>
                 </div>
               </div>
+
+              {meetingSpeakers.length > 0 && (
+                <details className="speaker-editor" style={{ width: '100%', maxWidth: 820, maxHeight: 160, overflowY: 'auto', margin: '0 auto 12px' }}>
+                  <summary style={{ cursor: 'pointer', padding: '8px 0' }}>Speaker names ({meetingSpeakers.length})</summary>
+                  <p>Names apply to every segment with the same speaker label in this meeting.</p>
+                  {meetingSpeakers.map((speaker) => (
+                    <label key={`${activeMeeting.id}:${speaker.id}:${speaker.name}`} style={{ display: 'inline-flex', alignItems: 'center', gap: 8, margin: '4px 12px 4px 0' }}>
+                      <span className="speaker-badge" style={SPEAKER_BADGE_STYLE}>Speaker {speaker.id}</span>
+                      <input
+                        aria-label={`Name for ${speaker.id}`}
+                        defaultValue={speaker.name}
+                        placeholder={speaker.id}
+                        disabled={status !== 'idle' || fastTranscribing || recordingOperationBusy}
+                        onBlur={(event) => {
+                          const name = event.currentTarget.value.trim();
+                          if (name !== speaker.name) void handleRenameSpeaker(activeMeeting, speaker.id, name);
+                        }}
+                      />
+                    </label>
+                  ))}
+                </details>
+              )}
 
               <div className="transcript-list" ref={transcriptListRef} aria-live="polite">
                 {activeMeeting.transcript.map((segment) => (
@@ -1674,7 +2217,7 @@ export default function App() {
                       <Play size={12} />
                       <time>{formatTimestamp(segment.offsetSeconds)}</time>
                     </button>
-                    <p>{segment.text}</p>
+                    <p>{segment.speakerId && <strong className="speaker-badge" style={SPEAKER_BADGE_STYLE}>{segment.speakerName || `Speaker ${segment.speakerId}`}</strong>}{segment.text}</p>
                   </article>
                 ))}
                 {azurePartialText && (
@@ -1701,6 +2244,18 @@ export default function App() {
             onStart={handleOpenRecordingChoice}
             onStop={handleStopRecording}
           />
+        </div>
+        </div>
+        {activeMeeting && assistantExpanded && <aside id="meeting-assistant-panel" className="meeting-assistant-dock" aria-label="Meeting Copilot">
+          <MeetingAssistant
+            meeting={activeMeeting}
+            recording={status === 'recording' && recordingMeetingIdRef.current === activeMeeting.id}
+            onClose={() => setAssistantExpanded(false)}
+            onSeek={(seconds) => { void handleAssistantSeek(activeMeeting, seconds); }}
+            playbackDisabled={status !== 'idle' || !activeMeeting.hasAudio}
+            disabled={status === 'starting' || status === 'saving' || recordingOperationBusy}
+          />
+        </aside>}
         </div>
         </>}
       </main>
@@ -1738,18 +2293,19 @@ export default function App() {
           >
             <h2 id="recording-choice-title">Start recording</h2>
             <p>Choose whether to create a new meeting session or add this recording to the session currently open.</p>
+            {activeMeeting && <p>Append uses this meeting’s language ({activeMeeting.language}) and {activeMeeting.transcriptionEngine?.startsWith('azure') ? 'Azure Speech live recognition (audio is sent to Azure)' : 'Foundry Local recognition'}, without changing your defaults.</p>}
             <div className="modal-actions recording-choice-actions">
               <button type="button" className="modal-secondary" onClick={() => setShowRecordingChoice(false)}>
                 Cancel
               </button>
-              <button type="button" className="modal-secondary" onClick={handleStartNewRecording}>
+              <button type="button" className="modal-secondary" onClick={handleStartNewRecording} disabled={status !== 'idle' || recordingOperationBusy || fastTranscribing}>
                 New recording
               </button>
               <button
                 type="button"
                 className="modal-danger"
                 onClick={handleAppendToOpenMeeting}
-                disabled={!activeMeeting}
+                disabled={!activeMeeting || status !== 'idle' || recordingOperationBusy || fastTranscribing}
                 title={activeMeeting ? `Append to ${activeMeeting.title}` : 'Open a saved meeting to append to it'}
               >
                 Append to open session

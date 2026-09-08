@@ -1,13 +1,18 @@
 mod audio;
 mod azure_auth;
 mod commands;
+mod copilot;
+mod speakers;
+mod foundry_local;
+mod speech_gate;
 mod video;
+mod windows_call_mute;
 
 #[cfg(test)]
 mod test;
 
 use anyhow::{anyhow, Context, Result};
-use audio::{CaptureBuffers, IncrementalWavWriter};
+use audio::IncrementalWavWriter;
 use rodio::Sink;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -15,7 +20,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 use tokio::sync::mpsc;
-use whisper_rs::WhisperContext;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +27,10 @@ pub struct TranscriptSegment {
     pub id: String,
     pub offset_seconds: f64,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,13 +74,6 @@ pub struct AudioOutputDevice {
     pub id: String,
     pub name: String,
     pub is_default: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WhisperModelStatus {
-    pub loaded: bool,
-    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +132,7 @@ pub struct RecordingRuntimeStatus {
     pub audio_recording_active: bool,
     pub audio_meeting_id: Option<String>,
     pub audio_elapsed_seconds: f64,
+    pub audio_microphone_muted: bool,
     pub screen_recording_active: bool,
     pub screen_video_id: Option<String>,
     pub screen_elapsed_seconds: f64,
@@ -138,8 +140,8 @@ pub struct RecordingRuntimeStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TranscriptionEngine {
-    Local,
     Azure,
+    FoundryLocal,
 }
 
 /// User-facing settings persisted across app restarts. All fields default to an
@@ -157,6 +159,9 @@ pub struct AppSettings {
     pub azure_tenant_id: String,
     pub azure_subscription_id: String,
     pub azure_language: String,
+    pub foundry_local_model_alias: String,
+    pub foundry_local_language: String,
+    pub foundry_local_chunking_mode: String,
     pub video_output_folder: String,
     pub video_codec: String,
     pub ffmpeg_path: String,
@@ -168,7 +173,6 @@ pub(crate) struct Store {
     pub(crate) meetings: Vec<Meeting>,
     #[serde(default)]
     pub(crate) videos: Vec<VideoRecording>,
-    pub(crate) whisper_model_path: Option<String>,
     #[serde(default)]
     pub(crate) settings: AppSettings,
 }
@@ -176,14 +180,19 @@ pub(crate) struct Store {
 pub(crate) struct RecorderSession {
     pub(crate) meeting_id: String,
     pub(crate) prior_recording_path: Option<PathBuf>,
+    pub(crate) base_offset_seconds: f64,
     pub(crate) stop_tx: mpsc::Sender<()>,
+    pub(crate) transcription_done_rx: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    pub(crate) recording_stop_tx: mpsc::Sender<()>,
+    pub(crate) recording_done_rx: tokio::sync::oneshot::Receiver<Result<(), String>>,
     pub(crate) audio_stop_tx: std::sync::mpsc::Sender<()>,
     pub(crate) audio_thread: std::thread::JoinHandle<()>,
     pub(crate) audio_done_rx: std::sync::mpsc::Receiver<()>,
-    pub(crate) recording_samples: Arc<Mutex<CaptureBuffers>>,
     pub(crate) audio_writer: Arc<Mutex<Option<IncrementalWavWriter>>>,
     pub(crate) recording_path: PathBuf,
     pub(crate) language: Arc<Mutex<String>>,
+    pub(crate) microphone_muted: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) teams_mute_monitor: Option<windows_call_mute::TeamsMuteMonitor>,
     pub(crate) started_at: std::time::Instant,
 }
 
@@ -208,7 +217,6 @@ pub(crate) struct AppState {
     pub(crate) recorder: Mutex<Option<RecorderSession>>,
     pub(crate) screen_recorder: Mutex<Option<ScreenRecorderSession>>,
     pub(crate) playback: Mutex<Option<PlaybackSession>>,
-    pub(crate) whisper: Mutex<Option<Arc<WhisperContext>>>,
     pub(crate) data_dir: PathBuf,
 }
 
@@ -220,21 +228,7 @@ impl AppState {
                 .join("MeetlyLite")
         });
         fs::create_dir_all(data_dir.join("recordings"))?;
-        let mut store = read_store(&data_dir)?;
-
-        // Auto-detect a local Whisper model when none is configured (or the saved
-        // path no longer exists) so recording can start without manual setup.
-        let has_valid_model = store
-            .whisper_model_path
-            .as_ref()
-            .map(|path| Path::new(path).is_file())
-            .unwrap_or(false);
-        if !has_valid_model {
-            if let Some(model_path) = find_default_model(&model_search_dirs(app, &data_dir)) {
-                store.whisper_model_path = Some(model_path.to_string_lossy().to_string());
-                let _ = write_store(&data_dir, &store);
-            }
-        }
+        let store = read_store(&data_dir)?;
 
         Ok(Self {
             store: Mutex::new(store),
@@ -242,7 +236,6 @@ impl AppState {
             recorder: Mutex::new(None),
             screen_recorder: Mutex::new(None),
             playback: Mutex::new(None),
-            whisper: Mutex::new(None),
             data_dir,
         })
     }
@@ -258,75 +251,6 @@ impl AppState {
 
 fn store_path(data_dir: &Path) -> PathBuf {
     data_dir.join("store.json")
-}
-
-/// Directories to probe when auto-detecting a bundled or local Whisper model.
-/// Covers the packaged resource dir, the app data dir, and the executable and
-/// working-directory trees so development and installed builds both work.
-fn model_search_dirs(app: &tauri::App, data_dir: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        dirs.push(resource_dir.join("models"));
-        dirs.push(resource_dir);
-    }
-    dirs.extend(fallback_model_dirs(data_dir));
-    dirs
-}
-
-/// Model search directories that do not require an `App` handle, so they can be
-/// used both at startup and lazily when a recording starts.
-pub(crate) fn fallback_model_dirs(data_dir: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![data_dir.join("models")];
-
-    if let Ok(exe) = std::env::current_exe() {
-        let mut base = exe.parent().map(Path::to_path_buf);
-        for _ in 0..5 {
-            let Some(dir) = base else { break };
-            dirs.push(dir.join("models"));
-            base = dir.parent().map(Path::to_path_buf);
-        }
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        dirs.push(cwd.join("models"));
-        if let Some(parent) = cwd.parent() {
-            dirs.push(parent.join("models"));
-        }
-    }
-
-    dirs
-}
-
-/// Returns the first `.bin` Whisper model found in the given directories,
-/// preferring files whose name starts with `ggml`.
-pub(crate) fn find_default_model(dirs: &[PathBuf]) -> Option<PathBuf> {
-    for dir in dirs {
-        let Ok(entries) = fs::read_dir(dir) else {
-            continue;
-        };
-        let mut models: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("bin")
-            })
-            .collect();
-        if models.is_empty() {
-            continue;
-        }
-        models.sort();
-        let preferred = models
-            .iter()
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .map(|name| name.starts_with("ggml"))
-                    .unwrap_or(false)
-            })
-            .cloned();
-        return preferred.or_else(|| models.into_iter().next());
-    }
-    None
 }
 
 pub(crate) fn read_store(data_dir: &Path) -> Result<Store> {
@@ -357,7 +281,7 @@ pub(crate) fn default_capture_mode() -> String {
 }
 
 pub(crate) fn default_transcription_engine() -> String {
-    "local".to_string()
+    "foundryLocal".to_string()
 }
 
 pub fn run() {
@@ -392,6 +316,11 @@ pub fn run() {
         })
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            copilot::copilot_status,
+            copilot::get_meeting_assistant,
+            copilot::ask_copilot,
+            copilot::set_action_item_done,
+            speakers::rename_speaker,
             commands::get_meetings,
             commands::refresh_meetings,
             commands::screen::get_videos,
@@ -408,11 +337,10 @@ pub fn run() {
             commands::screen::select_video_output_folder,
             commands::screen::select_ffmpeg_executable,
             commands::screen::open_video_recordings_folder,
-            commands::meetings::load_whisper_model,
-            commands::meetings::select_whisper_model,
-            commands::meetings::get_whisper_model_status,
             commands::get_settings,
             commands::save_settings,
+            commands::meetings::list_foundry_local_models,
+            commands::meetings::download_foundry_local_model,
             commands::meetings::start_recording,
             commands::meetings::stop_recording,
             commands::screen::start_screen_recording,

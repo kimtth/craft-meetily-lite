@@ -9,11 +9,13 @@ Meetly Lite is generated at the workspace root. The reference project in `ref-me
 
 * Compact side-panel transcription UI inspired by Microsoft Teams meeting panels
 * Rust/Tauri recording control flow
-* Local Whisper model loading through `whisper-rs`
+* Foundry Local model discovery and on-device speech-to-text
+* WebRTC VAD for local transcription
 * Optional Azure Speech live recognition and Fast Transcription for selected WAV, MP3, and MP4 files
 * Selectable microphone input capture through `cpal`
 * Simultaneous microphone and system audio capture with mixed recording output
 * Capture modes for microphone only, system audio only, or microphone plus system audio
+* Microsoft Teams mute-state synchronization on Windows 11
 * Per-session transcription language selection
 * Transcript segments emitted from Rust to the UI through Tauri events
 * Local meeting and transcript history stored under the app data directory
@@ -21,8 +23,40 @@ Meetly Lite is generated at the workspace root. The reference project in `ref-me
 * Recorded audio playback with per-transcript-segment navigation
 * Desktop and user-selected-area screen recording with FFmpeg H.264 or H.265 encoding
 * Local video catalog, export folder selection, and incomplete-recording recovery
-* Optional build-time Whisper acceleration for CUDA or Vulkan
-* No AI summary workflow
+* Optional GitHub Copilot recap, evidence-linked action items, and meeting chat
+* Optional Azure Fast speaker diarization with user-assigned speaker names
+
+## Meeting intelligence and timing (2026-09-08)
+
+The saved PCM sample timeline is authoritative for playback. Capture packets use
+a common clock; one mixer supplies both disk recording and transcription. Stateful
+resampling preserves fractional phase. Azure recognizer-relative offsets map through
+the first delivered PCM anchor, including after language changes and reconnects.
+Foundry language is snapshotted at utterance enqueue. Canonical locales are applied
+without changing global defaults when editing an existing meeting.
+
+The assistant uses the pinned official Rust Copilot SDK and bundled runtime over
+stdio. Empty runtime mode, disabled tools/config discovery, isolated temporary
+storage, bounded requests, and validated transcript references limit its access.
+Assistant history and task completion are stored separately per meeting and removed
+when that meeting is deleted. No summary or status request runs automatically.
+Final validated answers are displayed rather than unvalidated token streaming.
+
+The docked conversation pane defaults to Chat with a fixed composer and independent
+history scroll. Recording does not disable inference. Each request captures a
+server-owned confirmed-transcript snapshot; ordered-prefix integrity permits new
+segments but rejects changes to existing evidence or meeting metadata. Recording
+bookkeeping (duration, path, updatedAt, hasAudio) is excluded from the prefix proof.
+Assistant-only file locks remain held across inference; the Store mutex is held
+only briefly for snapshots and final validation/commit, so recording can append.
+Optional version-1 storage fields preserve snapshot coverage and integrity. Legacy
+history is reused only on exact fingerprint equality; unsafe history is omitted
+without deleting displayed messages or forcing recap generation.
+
+Azure re-transcription and diarization explicitly disclose audio upload and charges,
+and always create a new result. An anonymous speaker ID is not a person's identity;
+the user assigns display names. Changing the language of completed text edits its
+metadata only; it does not translate or re-transcribe it.
 
 ## Current Implementation Slice
 
@@ -43,8 +77,9 @@ flowchart TD
 	Tauri[Tauri command bridge]
 	Rust[Rust backend core]
 	Audio[cpal microphone capture]
-	Whisper[whisper-rs transcription]
+	Foundry[Foundry Local STT]
 	Azure[Azure Speech optional cloud transcription]
+	Teams[Teams mute state]
 	Screen[FFmpeg screen recording]
 	Store[Local app data store]
 	Exports[Transcript, audio, and video exports]
@@ -52,150 +87,57 @@ flowchart TD
 	UI --> Tauri
 	Tauri --> Rust
 	Rust --> Audio
-	Rust --> Whisper
+	Rust --> Foundry
 	Rust --> Azure
+	Teams --> Audio
 	Rust --> Screen
 	Rust --> Store
 	Rust --> Exports
 	Rust -- transcript-segment events --> UI
 ```
 
-## Development
+Foundry Local is the only local model runtime. WebRTC VAD provides
+utterance-based chunking and speech gating for fixed five-second chunks.
 
-Install dependencies:
+Microphone-enabled recordings read the active Teams call mute state. Muted
+microphone frames are replaced with equal-length silence so recording and
+transcript timing remain synchronized.
+
+## Development
 
 ```powershell
 npm install
-```
-
-Run the web frontend only:
-
-```powershell
-npm run dev
-```
-
-Run the Tauri desktop app:
-
-```powershell
+npm run build
 npm run tauri:dev
 ```
-
-Frontend build validation:
-
-```powershell
-npm run build
-```
-
-Rust backend validation from a VS 2022 Build Tools developer environment:
-
-```powershell
-cmd.exe /c 'call "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" && set "LIBCLANG_PATH=%ProgramFiles%\LLVM\bin" && set "PATH=%ProgramFiles%\CMake\bin;%ProgramFiles%\LLVM\bin;%PATH%" && cd /d "%CD%\src-tauri" && cargo check'
-```
-
-The Rust core stores app data in the OS app-data directory selected by Tauri.
-
-## Production
 
 Build the Windows desktop app:
 
 ```powershell
-npm install
 npm run tauri:build
 ```
 
-Build with automatic Whisper acceleration detection:
+Rust validation does not require LLVM, libclang, or a separate CMake
+installation:
 
 ```powershell
-npm run tauri:build:gpu
+cargo check --manifest-path src-tauri\Cargo.toml
+cargo test --manifest-path src-tauri\Cargo.toml --lib
 ```
 
-Build with a specific Whisper backend:
+The default desktop build outputs under `src-tauri\target\release`.
 
-```powershell
-npm run tauri:build:cuda
-npm run tauri:build:vulkan
-```
+## Foundry Local Models
 
-GPU acceleration is selected at build time. It is not a runtime setting in the app.
-Use `cuda` for NVIDIA GPUs with CUDA Toolkit installed, and `vulkan` for supported
-GPU drivers with Vulkan tooling. You can also set `TAURI_GPU_FEATURE` to
-`cuda` or `vulkan` before running `npm run tauri:build:gpu`.
-GPU builds use a short Cargo target directory at the project drive root (`<drive>:\mtg`), and
-prefer the Ninja CMake generator bundled with Visual Studio Build Tools to avoid
-Windows path-length and MSBuild FileTracker failures in generated Whisper/Vulkan
-CMake files.
+1. Open **Settings**.
+2. Select **Foundry Local** as the transcription engine.
+3. Select **Refresh** to load compatible speech models from the catalog.
+4. Choose a model alias.
+5. Select **Download / prepare** to cache the model and execution providers.
+6. Start recording.
 
-The default `npm run tauri:build` creates these files:
-
-* `src-tauri/target/release/meetly-lite.exe`
-* `src-tauri/target/release/bundle/nsis/Meetly Lite_0.1.0_x64-setup.exe`
-* `src-tauri/target/release/bundle/msi/Meetly Lite_0.1.0_x64_en-US.msi`
-
-GPU builds (`tauri:build:gpu`, `tauri:build:cuda`, and `tauri:build:vulkan`) redirect the Cargo target directory to `<drive>:\mtg`, so their
-output lands here instead:
-
-* `<drive>:\mtg\release\meetly-lite.exe`
-* `<drive>:\mtg\release\bundle\nsis\Meetly Lite_0.1.0_x64-setup.exe`
-* `<drive>:\mtg\release\bundle\msi\Meetly Lite_0.1.0_x64_en-US.msi`
-
-Install or run a GPU build from `<drive>:\mtg`. GPU builds never update the
-`src-tauri/target/release` files, so those paths keep stale code from an earlier
-default build. Running the old `src-tauri/target/release/meetly-lite.exe` after a
-GPU build is the most common cause of "my changes did not take effect."
-
-Use the installer for normal testing. Running the raw `meetly-lite.exe` also
-works, but it does not install shortcuts or app metadata.
-
-## Whisper Model Files
-
-The executable does not bundle a Whisper model. Download or copy a local
-`ggml-*.bin` model file and load it from the app settings with an absolute path.
-
-Download models from the official whisper.cpp model hosting location:
-
-* <https://huggingface.co/ggerganov/whisper.cpp/tree/main>
-
-Recommended starter models:
-
-* `ggml-base.en.bin` for English-only testing with a small download size
-* `ggml-base.bin` for multilingual testing
-* `ggml-small.en.bin` for better English accuracy when you can use more CPU and disk
-
-Create a local model folder and place the downloaded file there:
-
-```powershell
-New-Item -ItemType Directory -Force "$HOME\models"
-```
-
-Example model path:
-
-```text
-%USERPROFILE%\models\ggml-base.en.bin
-```
-
-The file must meet these conditions:
-
-* It exists on the local machine.
-* It is a file, not a folder.
-* It has a `.bin` extension.
-* It is a Whisper `ggml` model compatible with `whisper.cpp`.
-
-If model loading fails in the executable, check the exact path first. The app
-does not resolve paths relative to the executable directory. Use the full path
-shown in File Explorer.
-
-## Recommended Verification Flow
-
-1. Install or run the built desktop app.
-2. Open `Settings`.
-3. Select `Browse` next to `Whisper Model Path`.
-4. Choose the downloaded `ggml-*.bin` model file.
-5. Select `Load Model`.
-6. Choose the capture mode, microphone input, system audio output, and session language.
-7. Start recording from the microphone button.
-
-Do not use `npm run dev` to test model loading. The browser-only Vite preview
-cannot call Tauri native commands and cannot load Whisper models.
+Downloads are explicit. Once prepared, inference runs locally without Azure
+credentials.
 
 ## Native Backend Commands
 
@@ -217,9 +159,6 @@ The root Tauri backend provides these commands to the frontend:
 * `select_video_output_folder`
 * `select_ffmpeg_executable`
 * `open_video_recordings_folder`
-* `load_whisper_model`
-* `select_whisper_model`
-* `get_whisper_model_status`
 * `get_settings`
 * `save_settings`
 * `start_recording`
@@ -232,6 +171,8 @@ The root Tauri backend provides these commands to the frontend:
 * `get_azure_cli_access_token`
 * `sign_in_azure_cli`
 * `check_azure_cli_sign_in`
+* `list_foundry_local_models`
+* `download_foundry_local_model`
 * `rename_meeting`
 * `update_meeting_language`
 * `delete_meeting`
@@ -248,10 +189,8 @@ The root Tauri backend provides these commands to the frontend:
 The following checks pass:
 
 * `npm run build`
-* `cargo check` from the VS 2022 Build Tools developer environment with `LIBCLANG_PATH` set to `C:\Program Files\LLVM\bin`
-
-The remaining manual validation is a real recording and transcription run after
-loading a local Whisper model file.
+* `cargo check --manifest-path src-tauri\Cargo.toml`
+* `cargo test --manifest-path src-tauri\Cargo.toml --lib`
 
 ## Azure Speech Fast Transcription
 
@@ -305,7 +244,7 @@ the MP3 path and deletes the WAV only after the updated store is written.
 ```mermaid
 flowchart TD
 	UI[React side-panel UI]
-	Engine[Local Whisper or Azure Speech]
+	Engine[Foundry Local or Azure Speech]
 	Record[Start audio or screen recording]
 	Audio[Microphone and system audio stream]
 	STT[Transcription chunks]

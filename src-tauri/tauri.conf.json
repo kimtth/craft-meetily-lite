@@ -33,7 +33,8 @@
     "targets": ["nsis", "msi"],
     "icon": ["icons/icon.ico"],
     "resources": {
-      "resources/": "resources/"
+      "resources/": "resources/",
+      "resources/foundry-native/": ""
     }
   }
 }

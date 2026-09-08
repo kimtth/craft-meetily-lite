@@ -19,9 +19,11 @@ Before starting any implementation work, follow this sequence:
 
 ## Core Principles
 
-* Local-first by default: audio capture, recording, and Local Whisper transcription run on the user's machine.
+* Local-first by default: audio capture, recording, and Foundry Local transcription run on the user's machine.
 * Azure Speech is an approved, optional cloud engine for live recognition and Fast Transcription of a selected WAV, MP3, or MP4 file. MP4 input is converted locally to MP3 before upload. The UI must clearly state before use that audio is sent directly to Azure Speech. Do not add Azure Blob Storage, SAS URLs, or storage-account keys.
-* Real-time transcription: show the transcript while the meeting is in progress for Local Whisper and Azure Speech live recognition.
+* Real-time transcription: show the transcript while the meeting is in progress for Foundry Local and Azure Speech live recognition.
+* Approved 2026-09-08: optional GitHub Copilot meeting recap, actions, and conversation. Require explicit transcript-sharing consent, isolate each meeting, disable agent tools, and validate source citations. Never send actual meeting content during development without separate approval.
+* Approved 2026-09-08: optional Azure Fast speaker diarization and re-transcription. Require explicit audio-upload consent and preserve original recordings/transcripts as separate results. Speaker names are user-assigned, not biometric identification.
 
 ## UI Scope
 
@@ -38,7 +40,7 @@ The UI must support these workflows:
 
 ## AI Provider Scope
 
-Do not expose AI provider settings unless the implementation includes a real feature that uses them. The lightweight app supports Local Whisper and the implemented Azure Speech live and Fast Transcription workflows.
+Do not expose AI provider settings unless the implementation includes a real feature that uses them. The app supports Foundry Local, Azure Speech, and the explicitly consented GitHub Copilot assistant.
 
 If a future feature needs an AI provider, support only explicitly implemented local-first or approved providers. Do not add placeholder provider fields or decorative configuration UI.
 
@@ -46,7 +48,6 @@ If a future feature needs an AI provider, support only explicitly implemented lo
 
 Remove these features from the lightweight version:
 
-* AI-powered meeting summaries
 * Cross-platform support for macOS and Linux
 
 Target Windows only.

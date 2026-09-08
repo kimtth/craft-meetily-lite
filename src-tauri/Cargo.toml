@@ -3,16 +3,11 @@ name = "meetly-lite"
 version = "0.1.0"
 description = "Windows-first local meeting transcription app"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.94"
 
 [lib]
 name = "meetly_lite_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
-
-[features]
-default = []
-cuda = ["whisper-rs/cuda"]
-vulkan = ["whisper-rs/vulkan"]
 
 [build-dependencies]
 tauri-build = { version = "2.3.0", features = [] }
@@ -23,16 +18,22 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 cpal = "0.15"
 dirs = "5"
+foundry-local-sdk = { version = "1.2.0", features = ["winml"] }
+github-copilot-sdk = { version = "=1.0.13", default-features = false, features = ["bundled-cli"] }
+fs2 = "0.4"
 hound = "3.5"
 rodio = "0.19"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tauri = { version = "2.6", features = [] }
 tauri-plugin-dialog = "2.3"
+tempfile = "3"
 tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-whisper-rs = "0.16"
+wavekat-vad = { version = "0.1.16", default-features = false, features = ["webrtc"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61.3", features = ["ApplicationModel_Calls", "Foundation", "Win32_System_WinRT"] }

@@ -1,6 +1,22 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { AudioInputDevice, AudioOutputDevice, AppSettings, FastTranscriptionFile, FastTranscriptionProgress, Meeting, RecordingOptions, RecordingRuntimeStatus, ScreenAudioLevels, ScreenProcessingStatus, ScreenTarget, TranscriptSegment, VideoRecording, WhisperModelStatus } from './types';
+import type {
+  AudioInputDevice,
+  AudioOutputDevice,
+  AppSettings,
+  FastTranscriptionFile,
+  FastTranscriptionProgress,
+  FoundryDownloadProgress,
+  FoundryLocalModelCatalogEntry,
+  Meeting,
+  RecordingOptions,
+  RecordingRuntimeStatus,
+  ScreenAudioLevels,
+  ScreenProcessingStatus,
+  ScreenTarget,
+  TranscriptSegment,
+  VideoRecording,
+} from './types';
 
 const FALLBACK_MEETINGS_KEY = 'meetly-lite:fallback-meetings';
 const FALLBACK_SETTINGS_KEY = 'meetly-lite:settings';
@@ -31,6 +47,23 @@ export type NativeAudioChunkEvent = {
   meetingId: string;
   offsetSeconds: number;
   pcmBase64: string;
+};
+
+export type MicrophoneMuteChangedEvent = {
+  meetingId: string;
+  muted: boolean;
+};
+
+export type CallMuteWarningEvent = {
+  meetingId: string;
+  message: string;
+};
+
+export type NativeRecordingErrorEvent = {
+  meetingId: string;
+  message: string;
+  fatal: true;
+  recordingPath: string;
 };
 
 export type AzureCliAccessToken = {
@@ -104,6 +137,8 @@ export async function startNativeRecording(options: RecordingOptions = {}): Prom
     captureMode: options.captureMode,
     language: options.language,
     transcriptionEngine: options.transcriptionEngine,
+    foundryLocalModelAlias: options.foundryLocalModelAlias,
+    foundryLocalChunkingMode: options.foundryLocalChunkingMode,
   });
 }
 
@@ -179,6 +214,13 @@ export async function updateNativeMeetingLanguage(meetingId: string, language: s
   return invoke<Meeting>('update_meeting_language', { meetingId, language });
 }
 
+export async function renameNativeSpeaker(meetingId: string, speakerId: string, name: string): Promise<Meeting> {
+  if (!hasTauriRuntime()) {
+    return requireTauriRuntime('Speaker renaming');
+  }
+  return invoke<Meeting>('rename_speaker', { meetingId, speakerId, name });
+}
+
 export async function exportNativeTranscript(meetingId: string): Promise<string | null> {
   if (!hasTauriRuntime()) {
     return requireTauriRuntime('Transcript export');
@@ -221,25 +263,18 @@ export async function resumeNativePlayback(): Promise<void> {
   return invoke<void>('resume_playback');
 }
 
-export async function getWhisperModelStatus(): Promise<WhisperModelStatus> {
+export async function listFoundryLocalModels(): Promise<FoundryLocalModelCatalogEntry[]> {
   if (!hasTauriRuntime()) {
-    return { loaded: false, path: null };
+    return [];
   }
-  return invoke<WhisperModelStatus>('get_whisper_model_status');
+  return invoke<FoundryLocalModelCatalogEntry[]>('list_foundry_local_models');
 }
 
-export async function loadWhisperModel(modelPath: string): Promise<void> {
+export async function downloadFoundryLocalModel(alias: string): Promise<void> {
   if (!hasTauriRuntime()) {
-    return requireTauriRuntime('Whisper model loading');
+    return requireTauriRuntime('Foundry Local model download');
   }
-  return invoke<void>('load_whisper_model', { modelPath });
-}
-
-export async function selectWhisperModel(): Promise<string | null> {
-  if (!hasTauriRuntime()) {
-    return requireTauriRuntime('Whisper model file selection');
-  }
-  return invoke<string | null>('select_whisper_model');
+  return invoke<void>('download_foundry_local_model', { alias });
 }
 
 export async function setNativeMiniMode(enabled: boolean): Promise<void> {
@@ -265,11 +300,24 @@ export function onAudioChunk(callback: (event: NativeAudioChunkEvent) => void): 
   return listen<NativeAudioChunkEvent>('audio-chunk', (event) => callback(event.payload));
 }
 
+export function onRecordingError(callback: (event: NativeRecordingErrorEvent) => void): Promise<() => void> {
+  if (!hasTauriRuntime()) {
+    void callback;
+    return Promise.resolve(() => undefined);
+  }
+  return listen<NativeRecordingErrorEvent>('recording-error', (event) => callback(event.payload));
+}
+
 export async function selectFastTranscriptionAudio(): Promise<FastTranscriptionFile | null> {
   if (!hasTauriRuntime()) {
     return requireTauriRuntime('File transcription');
   }
   return invoke<FastTranscriptionFile | null>('select_fast_transcription_audio');
+}
+
+export function onTranscriptionError(callback: (message: string) => void): Promise<() => void> {
+  if (!hasTauriRuntime()) return Promise.resolve(() => undefined);
+  return listen<string>('transcription-error', (event) => callback(event.payload));
 }
 
 export async function transcribeFastAudio(
@@ -279,7 +327,12 @@ export async function transcribeFastAudio(
   endpoint: string,
   tenantId?: string,
   subscriptionId?: string,
+  uploadConsent = false,
+  diarization = false,
 ): Promise<Meeting> {
+  if (uploadConsent !== true) {
+    throw new Error('Explicit consent is required before sending this audio to Azure Speech.');
+  }
   if (!hasTauriRuntime()) {
     return requireTauriRuntime('File transcription');
   }
@@ -290,6 +343,8 @@ export async function transcribeFastAudio(
     endpoint,
     tenantId,
     subscriptionId,
+    uploadConsent,
+    diarization,
   });
 }
 
@@ -413,11 +468,40 @@ export function onScreenProcessingStatus(callback: (status: ScreenProcessingStat
   return listen<ScreenProcessingStatus>('screen-processing-status', (event) => callback(event.payload));
 }
 
+export function onMicrophoneMuteChanged(
+  callback: (event: MicrophoneMuteChangedEvent) => void,
+): Promise<() => void> {
+  if (!hasTauriRuntime()) {
+    void callback;
+    return Promise.resolve(() => undefined);
+  }
+  return listen<MicrophoneMuteChangedEvent>('microphone-mute-changed', (event) => callback(event.payload));
+}
+
+export function onCallMuteWarning(
+  callback: (event: CallMuteWarningEvent) => void,
+): Promise<() => void> {
+  if (!hasTauriRuntime()) {
+    void callback;
+    return Promise.resolve(() => undefined);
+  }
+  return listen<CallMuteWarningEvent>('call-mute-warning', (event) => callback(event.payload));
+}
+
+export function onFoundryDownloadProgress(callback: (event: FoundryDownloadProgress) => void): Promise<() => void> {
+  if (!hasTauriRuntime()) {
+    void callback;
+    return Promise.resolve(() => undefined);
+  }
+  return listen<FoundryDownloadProgress>('foundry-download-progress', (event) => callback(event.payload));
+}
+
 export async function getRecordingRuntimeStatus(): Promise<RecordingRuntimeStatus> {
   if (!hasTauriRuntime()) {
     return {
       audioRecordingActive: false,
       audioElapsedSeconds: 0,
+      audioMicrophoneMuted: false,
       screenRecordingActive: false,
       screenElapsedSeconds: 0,
     };
