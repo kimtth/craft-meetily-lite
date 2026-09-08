@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::AtomicBool;
 
 fn make_video(
     id: String,
@@ -285,6 +286,11 @@ pub(crate) fn get_recording_runtime_status(
             .as_ref()
             .map(|session| session.started_at.elapsed().as_secs_f64())
             .unwrap_or_default(),
+        audio_microphone_muted: recorder.as_ref().is_some_and(|session| {
+            session
+                .microphone_muted
+                .load(std::sync::atomic::Ordering::Acquire)
+        }),
         screen_recording_active: screen_recorder.is_some(),
         screen_video_id: screen_recorder
             .as_ref()
@@ -582,6 +588,7 @@ fn start_screen_audio_capture(
             &capture_mode,
             samples.clone(),
             None,
+            Arc::new(AtomicBool::new(false)),
         ) {
             Ok((streams, _)) => streams,
             Err(error) => {
