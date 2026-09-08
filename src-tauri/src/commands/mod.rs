@@ -6,11 +6,10 @@ use crate::audio::{
 use crate::azure_auth::{self, AzureCliAccessToken, AzureCliStatus};
 use crate::video::{self, ScreenTarget};
 use crate::{
-    default_capture_mode, default_language, fallback_model_dirs, read_store, write_store,
-    AppSettings, AppState, AudioChunkEvent, AudioInputDevice, AudioOutputDevice, Meeting,
-    PlaybackSession, RecorderSession, RecordingRuntimeStatus, ScreenAudioLevelEvent,
-    ScreenProcessingStatusEvent, ScreenRecorderSession, Store, TranscriptEvent, TranscriptSegment,
-    TranscriptionEngine, VideoRecording, WhisperModelStatus,
+    default_capture_mode, default_language, read_store, write_store, AppSettings, AppState,
+    AudioChunkEvent, AudioInputDevice, AudioOutputDevice, Meeting, PlaybackSession,
+    RecorderSession, RecordingRuntimeStatus, ScreenAudioLevelEvent, ScreenProcessingStatusEvent,
+    ScreenRecorderSession, Store, TranscriptEvent, TranscriptSegment, VideoRecording,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -27,13 +26,11 @@ use tauri::{
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 pub(crate) mod meetings;
 pub(crate) mod screen;
 pub(crate) mod transcription;
 
-const TRANSCRIPT_CHUNK_SECONDS: u64 = 5;
 const TRANSCRIPT_SAMPLE_RATE: f64 = 16_000.0;
 const AUDIO_DEVICE_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 const AUDIO_THREAD_STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -43,16 +40,6 @@ const FAST_TRANSCRIPTION_MAX_DURATION: Duration = Duration::from_secs(2 * 60 * 6
 
 fn now_string() -> String {
     Utc::now().to_rfc3339()
-}
-
-/// Number of CPU threads Whisper should use for inference. Using the machine's
-/// available parallelism keeps transcription faster than real time so the live
-/// loop does not fall behind. Falls back to 4 if the count cannot be queried.
-fn whisper_thread_count() -> std::os::raw::c_int {
-    std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(4)
-        .clamp(1, 16) as std::os::raw::c_int
 }
 
 fn format_timestamp(seconds: f64) -> String {
@@ -182,60 +169,6 @@ impl Drop for TemporaryMediaFile {
     }
 }
 
-fn transcribe_samples(
-    context: Arc<WhisperContext>,
-    samples_16k: Vec<f32>,
-    language: &str,
-) -> Result<String> {
-    if samples_16k.len() < 16_000 {
-        return Ok(String::new());
-    }
-    let mut state = context
-        .create_state()
-        .context("Failed to create Whisper state")?;
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_n_threads(whisper_thread_count());
-    // Each chunk is transcribed independently, so previous chunk tokens must not
-    // be reused as a prompt (that both slows inference and causes cross-chunk
-    // repetition/hallucination).
-    params.set_no_context(true);
-    params.set_print_progress(false);
-    params.set_print_special(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
-    if language == "auto" {
-        params.set_language(None);
-    } else {
-        params.set_language(Some(language));
-    }
-    state
-        .full(params, &samples_16k)
-        .context("Whisper transcription failed")?;
-    let segments = state.full_n_segments();
-    let mut text = String::new();
-    for index in 0..segments {
-        let Some(segment) = state.get_segment(index) else {
-            continue;
-        };
-        let segment_text = segment.to_str_lossy()?;
-        text.push_str(segment_text.trim());
-        text.push(' ');
-    }
-    Ok(text.trim().to_string())
-}
-
-fn normalize_transcription_engine(value: Option<String>) -> TranscriptionEngine {
-    match value
-        .as_deref()
-        .map(str::trim)
-        .map(str::to_lowercase)
-        .as_deref()
-    {
-        Some("azure") => TranscriptionEngine::Azure,
-        _ => TranscriptionEngine::Local,
-    }
-}
-
 fn safe_file_stem(value: &str) -> String {
     let sanitized: String = value
         .chars()
@@ -270,6 +203,37 @@ fn open_path_in_explorer(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod language_tests {
+    use super::*;
+
+    #[test]
+    fn locale_normalization_roundtrips_canonical_azure_values() {
+        for (input, expected) in [
+            (" en-us ", "en-US"), ("KO_kr", "ko-KR"), ("ja-jp", "ja-JP"),
+            ("ZH-cn", "zh-CN"), ("es-es", "es-ES"), ("fr-fr", "fr-FR"),
+            ("DE-de", "de-DE"), ("en-gb", "en-GB"), ("sr-latn-rs", "sr-Latn-RS"),
+        ] {
+            assert_eq!(normalize_language(Some(input.into())), expected);
+            assert_eq!(normalize_language(Some(expected.into())), expected);
+        }
+    }
+
+    #[test]
+    fn azure_bare_languages_use_supported_ui_locale_defaults() {
+        for (input, expected) in [
+            ("en", "en-US"), ("ko", "ko-KR"), ("ja", "ja-JP"), ("zh", "zh-CN"),
+            ("es", "es-ES"), ("fr", "fr-FR"), ("de", "de-DE"), ("auto", "en-US"),
+        ] {
+            assert_eq!(normalize_azure_language(Some(input.into())), expected);
+        }
+        assert_eq!(normalize_language(Some("auto".into())), "auto");
+        assert_eq!(normalize_language(Some("KO".into())), "ko");
+        assert_eq!(normalize_language(Some("  ".into())), default_language());
+        assert_eq!(normalize_language(None), default_language());
+    }
+}
+
 fn select_path_in_explorer(path: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -282,15 +246,60 @@ fn select_path_in_explorer(path: &Path) -> Result<()> {
 }
 
 fn normalize_language(language: Option<String>) -> String {
-    let trimmed = language
-        .unwrap_or_else(default_language)
-        .trim()
-        .to_lowercase();
+    let value = language.unwrap_or_else(default_language);
+    let trimmed = value.trim();
     if trimmed.is_empty() {
-        default_language()
-    } else {
-        trimmed
+        return default_language();
     }
+    trimmed.replace('_', "-").split('-').enumerate().map(|(index, part)| {
+        if index == 0 {
+            part.to_ascii_lowercase()
+        } else if part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+            part.to_ascii_uppercase()
+        } else if part.len() == 4 && part.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+            let mut script = part.to_ascii_lowercase();
+            script[..1].make_ascii_uppercase();
+            script
+        } else {
+            part.to_ascii_lowercase()
+        }
+    }).collect::<Vec<_>>().join("-")
+}
+
+fn normalized_meeting(mut meeting: Meeting) -> Meeting {
+    meeting.language = if meeting.transcription_engine.starts_with("azure") {
+        normalize_azure_language(Some(meeting.language))
+    } else {
+        normalize_language(Some(meeting.language))
+    };
+    meeting
+}
+
+fn normalize_azure_language(language: Option<String>) -> String {
+    let language = normalize_language(language);
+    match language.as_str() {
+        "auto" | "en" => "en-US".into(),
+        "ko" => "ko-KR".into(),
+        "ja" => "ja-JP".into(),
+        "zh" => "zh-CN".into(),
+        "es" => "es-ES".into(),
+        "fr" => "fr-FR".into(),
+        "de" => "de-DE".into(),
+        _ => language,
+    }
+}
+
+fn normalized_settings(mut settings: AppSettings) -> AppSettings {
+    for language in [&mut settings.language, &mut settings.foundry_local_language] {
+        // Blank settings are intentionally left blank for frontend defaults.
+        if !language.trim().is_empty() {
+            *language = normalize_language(Some(language.clone()));
+        }
+    }
+    if !settings.azure_language.trim().is_empty() {
+        settings.azure_language = normalize_azure_language(Some(settings.azure_language));
+    }
+    settings
 }
 
 fn normalize_capture_mode(capture_mode: Option<String>) -> String {
@@ -324,7 +333,7 @@ pub(crate) fn get_meetings(state: tauri::State<'_, AppState>) -> Result<Vec<Meet
         .store
         .lock()
         .map_err(|_| "Store lock poisoned".to_string())?;
-    Ok(store.meetings.clone())
+    Ok(store.meetings.iter().cloned().map(normalized_meeting).collect())
 }
 
 #[tauri::command]
@@ -333,6 +342,7 @@ pub(crate) fn refresh_meetings(state: tauri::State<'_, AppState>) -> Result<Vec<
     let meetings: Vec<Meeting> = refreshed
         .meetings
         .into_iter()
+        .map(normalized_meeting)
         .filter(|meeting| match &meeting.recording_path {
             // Drop meetings whose recorded audio file was deleted from disk.
             Some(path) => Path::new(path).exists(),
@@ -355,7 +365,7 @@ pub(crate) fn get_settings(state: tauri::State<'_, AppState>) -> Result<AppSetti
         .store
         .lock()
         .map_err(|_| "Store lock poisoned".to_string())?;
-    Ok(store.settings.clone())
+    Ok(normalized_settings(store.settings.clone()))
 }
 
 #[tauri::command]
@@ -367,7 +377,7 @@ pub(crate) fn save_settings(
         .store
         .lock()
         .map_err(|_| "Store lock poisoned".to_string())?;
-    let previous = std::mem::replace(&mut store.settings, settings);
+    let previous = std::mem::replace(&mut store.settings, normalized_settings(settings));
     if let Err(error) = write_store(&state.data_dir, &store) {
         store.settings = previous;
         return Err(error.to_string());
@@ -380,6 +390,9 @@ pub(crate) fn delete_meeting(
     state: tauri::State<'_, AppState>,
     meeting_id: String,
 ) -> Result<(), String> {
+    // Keep the assistant lock through deletion: in-flight inference cannot
+    // recreate private content after the meeting is removed.
+    let _assistant_guard = crate::copilot::remove_for_meeting(&state.data_dir, &meeting_id)?;
     let recording_path = {
         let mut store = state
             .store
@@ -432,9 +445,13 @@ pub(crate) fn export_transcript(
         format_timestamp(meeting.duration_seconds)
     );
     for segment in &meeting.transcript {
+        let speaker = segment.speaker_name.clone()
+            .or_else(|| segment.speaker_id.as_ref().map(|id| format!("Speaker {id}")))
+            .map(|name| format!("{name}: ")).unwrap_or_default();
         text.push_str(&format!(
-            "[{}] {}\n",
+            "[{}] {}{}\n",
             format_timestamp(segment.offset_seconds),
+            speaker,
             segment.text
         ));
     }

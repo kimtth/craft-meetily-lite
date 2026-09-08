@@ -2,6 +2,8 @@ export type TranscriptSegment = {
   id: string;
   offsetSeconds: number;
   text: string;
+  speakerId?: string | null;
+  speakerName?: string | null;
 };
 
 export type Meeting = {
@@ -22,7 +24,7 @@ export type Meeting = {
   transcriptionEngine?: MeetingTranscriptionEngine;
 };
 
-export type MeetingTranscriptionEngine = 'local' | 'azure' | 'azure-fast';
+export type MeetingTranscriptionEngine = 'foundryLocal' | 'azure' | 'azure-fast';
 
 export type FastTranscriptionFile = {
   path: string;
@@ -73,9 +75,22 @@ export type AudioOutputDevice = {
   isDefault: boolean;
 };
 
-export type WhisperModelStatus = {
-  loaded: boolean;
-  path: string | null;
+export type FoundryLocalModelCatalogEntry = {
+  alias: string;
+  displayName?: string | null;
+  task?: string | null;
+  modelType: string;
+  inputModalities?: string | null;
+  outputModalities?: string | null;
+  cached: boolean;
+  fileSizeMb?: number | null;
+};
+
+export type FoundryDownloadProgress = {
+  alias: string;
+  phase: 'eps' | 'model' | 'done' | 'error';
+  percent: number;
+  message?: string;
 };
 
 export type RecordingOptions = {
@@ -86,11 +101,14 @@ export type RecordingOptions = {
   captureMode?: string;
   language?: string;
   transcriptionEngine?: TranscriptionEngine;
+  foundryLocalModelAlias?: string;
+  foundryLocalChunkingMode?: FoundryLocalChunkingMode;
 };
 
 export type RecorderStatus = 'idle' | 'starting' | 'recording' | 'saving';
 
-export type TranscriptionEngine = Exclude<MeetingTranscriptionEngine, 'azure-fast'>;
+export type TranscriptionEngine = 'azure' | 'foundryLocal';
+export type FoundryLocalChunkingMode = 'utterance' | 'fixed5Seconds';
 
 export type AppSettings = {
   transcriptionEngine: string;
@@ -103,6 +121,9 @@ export type AppSettings = {
   azureTenantId: string;
   azureSubscriptionId: string;
   azureLanguage: string;
+  foundryLocalModelAlias: string;
+  foundryLocalLanguage: string;
+  foundryLocalChunkingMode: FoundryLocalChunkingMode;
   videoOutputFolder: string;
   videoCodec: string;
   ffmpegPath: string;
@@ -123,6 +144,7 @@ export type RecordingRuntimeStatus = {
   audioRecordingActive: boolean;
   audioMeetingId?: string | null;
   audioElapsedSeconds: number;
+  audioMicrophoneMuted: boolean;
   screenRecordingActive: boolean;
   screenVideoId?: string | null;
   screenElapsedSeconds: number;
