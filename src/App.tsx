@@ -1774,8 +1774,8 @@ export default function App() {
             microphoneMuted={microphoneMuted}
           />
           <div className="top-actions">
-            {activeMeeting && !showVideoWorkspace && !showBatchTranscription && <button type="button" className="text-action" aria-expanded={assistantExpanded} aria-controls="meeting-assistant-panel" onClick={() => setAssistantExpanded((expanded) => !expanded)}>
-              Copilot · GHCP
+            {activeMeeting && !showVideoWorkspace && !showBatchTranscription && <button type="button" className="text-action" title="Chat, recaps, and action items for this meeting" aria-expanded={assistantExpanded} aria-controls="meeting-assistant-panel" onClick={() => setAssistantExpanded((expanded) => !expanded)}>
+              <MessageSquareText size={16} aria-hidden="true" /> Meeting Assistant
             </button>}
             <button onClick={() => handleMiniModeChange(true)} title="Mini mode" aria-label="Mini mode">
               <Minimize2 size={16} />
@@ -2246,7 +2246,7 @@ export default function App() {
           />
         </div>
         </div>
-        {activeMeeting && assistantExpanded && <aside id="meeting-assistant-panel" className="meeting-assistant-dock" aria-label="Meeting Copilot">
+        {activeMeeting && assistantExpanded && <aside id="meeting-assistant-panel" className="meeting-assistant-dock" aria-label="Meeting Assistant">
           <MeetingAssistant
             meeting={activeMeeting}
             recording={status === 'recording' && recordingMeetingIdRef.current === activeMeeting.id}

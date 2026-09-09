@@ -26,37 +26,40 @@ Meetly Lite is generated at the workspace root. The reference project in `ref-me
 * Optional GitHub Copilot recap, evidence-linked action items, and meeting chat
 * Optional Azure Fast speaker diarization with user-assigned speaker names
 
-## Meeting intelligence and timing (2026-09-08)
+## Meeting intelligence and timing
 
-The saved PCM sample timeline is authoritative for playback. Capture packets use
-a common clock; one mixer supplies both disk recording and transcription. Stateful
-resampling preserves fractional phase. Azure recognizer-relative offsets map through
-the first delivered PCM anchor, including after language changes and reconnects.
-Foundry language is snapshotted at utterance enqueue. Canonical locales are applied
-without changing global defaults when editing an existing meeting.
+### Audio timeline
 
-The assistant uses the pinned official Rust Copilot SDK and bundled runtime over
-stdio. Empty runtime mode, disabled tools/config discovery, isolated temporary
-storage, bounded requests, and validated transcript references limit its access.
-Assistant history and task completion are stored separately per meeting and removed
-when that meeting is deleted. No summary or status request runs automatically.
-Final validated answers are displayed rather than unvalidated token streaming.
+One clock and mixer supply both recording and transcription, keeping timestamps
+aligned with saved audio. Stateful resampling preserves fractional samples. Azure
+offsets are anchored to delivered PCM after reconnects or language changes; Foundry
+captures the language when each utterance is queued.
 
-The docked conversation pane defaults to Chat with a fixed composer and independent
-history scroll. Recording does not disable inference. Each request captures a
-server-owned confirmed-transcript snapshot; ordered-prefix integrity permits new
-segments but rejects changes to existing evidence or meeting metadata. Recording
-bookkeeping (duration, path, updatedAt, hasAudio) is excluded from the prefix proof.
-Assistant-only file locks remain held across inference; the Store mutex is held
-only briefly for snapshots and final validation/commit, so recording can append.
-Optional version-1 storage fields preserve snapshot coverage and integrity. Legacy
-history is reused only on exact fingerprint equality; unsafe history is omitted
-without deleting displayed messages or forcing recap generation.
+### Meeting Assistant
 
-Azure re-transcription and diarization explicitly disclose audio upload and charges,
-and always create a new result. An anonymous speaker ID is not a person's identity;
-the user assigns display names. Changing the language of completed text edits its
-metadata only; it does not translate or re-transcribe it.
+* **Runtime:** the pinned Copilot Rust SDK uses a bundled runtime over stdio, with
+	isolated temporary storage and tools and ambient configuration discovery disabled.
+* **Account and model:** explicit status checks discover models for the selected
+	account. Inference uses that account too, without switching the global GitHub CLI
+	login. Opening the pane never checks status or generates answers automatically.
+* **Live context:** each submission snapshots confirmed transcript text. New speech
+	is allowed while an answer is pending; edits to its evidence invalidate the result.
+	Unsafe history is excluded from later requests without deleting saved messages.
+* **Validation:** answers appear only after validation. Inline timestamp citations
+	resolve through saved, field-specific source lists; legacy references are not guessed.
+* **Storage and locking:** assistant history is separate from the meeting store.
+	A per-meeting file lock spans inference; the Store mutex is held only for snapshot
+	reads and final validation/commit, allowing recording to continue.
+* **Clear session:** confirmation removes only that meeting's assistant history,
+	recap, actions and completion state. Audio and transcripts remain intact; clearing
+	is rejected while the assistant lock is held. Deleting a meeting also removes its
+	assistant data.
+
+### Re-transcription and speakers
+
+Azure re-transcription requires explicit audio-upload consent and creates a new
+meeting, preserving the original. Speaker IDs are anonymous labels, not verified
+identities. Editing a saved meeting's language changes metadata only.
 
 ## Current Implementation Slice
 
@@ -268,7 +271,6 @@ flowchart TD
 
 The lightweight version excludes these reference-project capabilities:
 
-* AI-powered meeting summaries
 * Summary templates and editor workflow
-* Ollama, Claude, Groq, OpenRouter, OpenAI-compatible, and built-in summary providers
+* Direct Ollama, Claude, Groq, OpenRouter, OpenAI-compatible, and built-in summary providers (models exposed through GitHub Copilot remain supported)
 * macOS and Linux support paths as product targets
