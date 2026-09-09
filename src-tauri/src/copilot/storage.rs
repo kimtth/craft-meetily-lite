@@ -96,6 +96,12 @@ pub(super) fn remove(root: &Path, meeting_id: &str) -> Result<(), String> {
     }
 }
 
+pub(super) fn clear(root: &Path, meeting_id: &str) -> Result<AssistantState, String> {
+    let _guard = lock(root, meeting_id)?;
+    remove(root, meeting_id).map_err(|_| "Could not clear assistant session; retry".to_string())?;
+    Ok(AssistantState::default())
+}
+
 pub(super) fn lock(root: &Path, meeting_id: &str) -> Result<File, String> {
     // All callers must first verify the meeting exists. OS locks reject concurrent
     // requests, including a second app process. The file guard IS held across
@@ -173,6 +179,45 @@ pub(super) fn save(root: &Path, meeting_id: &str, saved: &Saved) -> Result<(), S
 mod tests {
     use super::*;
     use schema::ActionItem;
+
+    #[test]
+    fn clear_removes_only_selected_assistant_and_preserves_media_and_other_meetings() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("store.json"), b"synthetic transcript").unwrap();
+        fs::write(root.path().join("recording.mp3"), b"synthetic recording").unwrap();
+        let meeting = schema::synthetic_meeting();
+        {
+            let _guard = lock(root.path(), &meeting.id).unwrap();
+            let mut saved = load(root.path(), &meeting.id).unwrap();
+            answer(&mut saved, &meeting);
+            saved.completions.insert("done".into(), true);
+            save(root.path(), &meeting.id, &saved).unwrap();
+        }
+        { let _guard = lock(root.path(), "other").unwrap();
+          fs::write(path(root.path(), "other"), b"other assistant untouched").unwrap(); }
+        let state = clear(root.path(), &meeting.id).unwrap();
+        assert!(state.messages.is_empty() && state.action_items.is_empty() && state.recap.is_none());
+        let saved = load(root.path(), &meeting.id).unwrap();
+        assert!(saved.completions.is_empty() && saved.assistant.messages.is_empty());
+        assert!(!path(root.path(), &meeting.id).exists());
+        assert!(path(root.path(), &meeting.id).with_extension("lock").exists());
+        assert_eq!(fs::read(path(root.path(), "other")).unwrap(), b"other assistant untouched");
+        assert_eq!(fs::read(root.path().join("store.json")).unwrap(), b"synthetic transcript");
+        assert_eq!(fs::read(root.path().join("recording.mp3")).unwrap(), b"synthetic recording");
+        assert!(clear(root.path(), &meeting.id).is_ok());
+    }
+
+    #[test]
+    fn clear_rejects_inflight_lock_and_can_remove_corrupt_assistant_afterwards() {
+        let root = tempfile::tempdir().unwrap();
+        let guard = lock(root.path(), "a").unwrap();
+        fs::write(path(root.path(), "a"), b"corrupt synthetic assistant").unwrap();
+        assert!(clear(root.path(), "a").is_err());
+        assert_eq!(fs::read(path(root.path(), "a")).unwrap(), b"corrupt synthetic assistant");
+        drop(guard);
+        assert!(clear(root.path(), "a").is_ok());
+        assert!(!path(root.path(), "a").exists());
+    }
 
     #[test]
     fn hashes_keep_paths_bounded_and_meeting_scoped() {

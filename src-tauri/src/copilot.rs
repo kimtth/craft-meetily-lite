@@ -7,7 +7,7 @@ mod storage;
 
 pub(crate) use schema::{AssistantState, CopilotStatus};
 use crate::{AppState, Meeting};
-use schema::{Evidence, Kind, ModelReply, Snapshot};
+use schema::{Evidence, ModelReply, Snapshot};
 use serde_json::json;
 use std::{collections::BTreeSet, future::Future, sync::OnceLock, time::Duration};
 use tauri::{AppHandle, State};
@@ -77,11 +77,14 @@ fn commit_snapshot(root: &std::path::Path, latest: &Meeting, snapshot: &Snapshot
 }
 
 fn history_input(saved: &storage::Saved, current: &Meeting) -> Result<serde_json::Value, String> {
-    // Strip structured citation IDs and coverage; do not send recap/action
-    // objects as evidence. Text (including embedded IDs) is context only and
-    // cannot extend the model's request-local citation allowlist.
+    // Strip structured citation IDs, local inline markers and coverage; do not
+    // send recap/action objects as evidence. Legacy text is context only and
+    // cannot extend the model's request-local citation allowlist. No disk edits.
     let history: Vec<_> = saved.history_for(current)?.into_iter()
-        .map(|message| json!({"role":message.role, "text":message.text})).collect();
+        .map(|message| {
+            let text = if message.role == schema::Role::Assistant { schema::history_text(&message.text) } else { message.text };
+            json!({"role":message.role, "text":text})
+        }).collect();
     let history_json = serde_json::to_string(&history).map_err(|_| "Could not encode history")?;
     if history_json.len() > schema::MAX_HISTORY_BYTES || saved.assistant.messages.len() > 198 {
         return Err("Assistant history limit reached; no history was truncated or sent.".into());
@@ -104,11 +107,28 @@ pub(crate) async fn get_meeting_assistant(
 }
 
 #[tauri::command]
-pub(crate) async fn copilot_status() -> CopilotStatus {
+pub(crate) async fn clear_meeting_assistant(
+    meeting_id: String,
+    state: State<'_, AppState>,
+) -> Result<AssistantState, String> {
+    meeting(&state, &meeting_id)?;
+    // Local assistant file only. In-flight generation holds the same lock and
+    // must finish before clearing; it cannot resurrect a cleared response.
+    storage::clear(&state.data_dir, &meeting_id)
+}
+
+#[tauri::command]
+pub(crate) async fn copilot_status(account: Option<String>) -> CopilotStatus {
+    if let Err(detail) = schema::validate_account(account.as_deref()) {
+        return CopilotStatus::unavailable(detail);
+    }
     let Ok(_slot) = RUNTIME_SLOTS.get_or_init(|| Semaphore::new(2)).try_acquire() else {
         return CopilotStatus::unavailable("Copilot is busy; retry status shortly");
     };
-    match runtime::Runtime::start().await {
+    // Account enumeration is opt-in via this IPC only, never via Runtime::status
+    // (which is also called during inference). Failure is an empty picker.
+    let accounts = runtime::local_accounts().await;
+    let mut result = match runtime::Runtime::start(account.as_deref()).await {
         Ok(runtime) => {
             let result = runtime.status().await;
             match runtime.close().await {
@@ -117,7 +137,9 @@ pub(crate) async fn copilot_status() -> CopilotStatus {
             }
         }
         Err(detail) => CopilotStatus::unavailable(detail),
-    }
+    };
+    result.accounts = accounts;
+    result
 }
 
 #[tauri::command]
@@ -129,9 +151,11 @@ pub(crate) async fn ask_copilot(
     kind: String,
     model: Option<String>,
     consent: bool,
+    account: Option<String>,
 ) -> Result<AssistantState, String> {
     // Must remain before runtime extraction/start, auth checks, or prompt construction.
     let kind = schema::validate_request(consent, &kind, &prompt, model.as_deref())?;
+    schema::validate_account(account.as_deref())?;
     // Server-owned clone of confirmed Store segments at entry. Recording can
     // append freely afterward; no caller-supplied or provisional evidence.
     let current = meeting(&state, &meeting_id)?;
@@ -146,7 +170,7 @@ pub(crate) async fn ask_copilot(
     let history = history_input(&saved, &current)?;
     let _slot = RUNTIME_SLOTS.get_or_init(|| Semaphore::new(2)).try_acquire()
         .map_err(|_| "Copilot is busy with other meetings; retry shortly")?;
-    let runtime = runtime::Runtime::start().await?;
+    let runtime = runtime::Runtime::start(account.as_deref()).await?;
     let work = async {
         let status = runtime.status().await;
         if !status.authenticated || status.models.is_empty() {
@@ -187,16 +211,17 @@ pub(crate) async fn ask_copilot(
                 "chunkNotes":notes, "history":history, "allowedSourceIds":permitted,
                 "notice":"Every transcript chunk was summarized; summaries are lossy. Do not claim exhaustive detail."})
         };
-        let mut reply = generate_validated(input, "Final meeting answer", &mut retry_used,
+        let reply = generate_validated(input, "Final meeting answer", &mut retry_used,
             |input| runtime.generate(&chosen, schema::REPLY_INSTRUCTIONS, input),
             |raw| {
-                let reply = schema::validate_reply(raw, kind, &model_evidence)?;
+                let mut reply = schema::validate_reply(raw, kind, &model_evidence)?;
                 // Synthesis citations must also have survived summarization.
                 schema::validate_reply_sources(&reply, &permitted)?;
+                // Include inline conversion/budget failures in the same single
+                // validation retry. UI/storage receive original IDs only.
+                reply.restore_source_ids(&source_map)?;
                 Ok(reply)
             }).await?;
-        // UI/storage/playback still receive original segment IDs, never aliases.
-        reply.restore_source_ids(&source_map)?;
         Ok::<ModelReply, String>(reply)
     };
     let result = tokio::time::timeout(Duration::from_secs(600), work).await
@@ -243,10 +268,61 @@ pub(crate) async fn set_action_item_done(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use schema::Kind;
     use std::{cell::RefCell, collections::VecDeque, future::ready, rc::Rc};
+
+    #[test]
+    fn status_wire_has_explicit_null_identity_source_and_safe_account_array() {
+        let unavailable = serde_json::to_value(CopilotStatus::unavailable("Synthetic failure")).unwrap();
+        assert_eq!(unavailable, json!({"authenticated":false,"detail":"Synthetic failure","models":[],
+            "login":null,"credentialSource":null,"accounts":[]}));
+        let status = CopilotStatus { authenticated: true, detail: "Synthetic success".into(),
+            models: vec![schema::CopilotModel { id: "auto".into(), name: "Auto".into() }],
+            login: Some("synthetic_managed".into()), credential_source: Some("gh:github.com:synthetic_managed".into()),
+            accounts: vec!["synthetic-active".into(), "synthetic_managed".into()] };
+        assert_eq!(serde_json::to_value(status).unwrap(), json!({"authenticated":true,"detail":"Synthetic success",
+            "models":[{"id":"auto","name":"Auto"}],"login":"synthetic_managed",
+            "credentialSource":"gh:github.com:synthetic_managed","accounts":["synthetic-active","synthetic_managed"]}));
+    }
+
+    #[tokio::test]
+    async fn invalid_status_account_is_rejected_without_processes_or_network() {
+        let status = copilot_status(Some("--invalid-synthetic-account".into())).await;
+        assert!(!status.authenticated);
+        assert!(status.accounts.is_empty());
+        assert!(status.models.is_empty());
+        assert!(status.login.is_none());
+        assert!(status.credential_source.is_none());
+        assert!(!status.detail.contains("--invalid-synthetic-account"));
+    }
 
     fn chunk() -> Vec<schema::EvidencePart> {
         vec![schema::EvidencePart { id: "e1".into(), offset_seconds: 42.0, text: "Synthetic fact".into() }]
+    }
+
+    #[test]
+    fn new_inline_reply_roundtrips_and_history_projection_never_rewrites_legacy_messages() {
+        let meeting = schema::synthetic_meeting();
+        let root = tempfile::tempdir().unwrap();
+        let _guard = storage::lock(root.path(), &meeting.id).unwrap();
+        let mut saved = storage::load(root.path(), &meeting.id).unwrap();
+        saved.apply_reply(&meeting, Kind::Chat, "Old question".into(),
+            ModelReply::Chat { text: "Legacy 【e1、e10】".into(), source_ids: vec!["source-a".into()] }).unwrap();
+        let legacy = serde_json::to_value(&saved.assistant.messages).unwrap();
+        let (evidence, map) = Evidence::from_meeting(&meeting).unwrap().for_model().unwrap();
+        let mut reply = schema::validate_reply(r#"{"kind":"chat","text":"New [e2]","sourceIds":["e2"]}"#, Kind::Chat, &evidence).unwrap();
+        reply.restore_source_ids(&map).unwrap();
+        saved.apply_reply(&meeting, Kind::Chat, "New question".into(), reply).unwrap();
+        storage::save(root.path(), &meeting.id, &saved).unwrap();
+        let saved = storage::load(root.path(), &meeting.id).unwrap();
+        let before = serde_json::to_value(&saved).unwrap();
+        assert_eq!(serde_json::to_value(&saved.assistant.messages[..2]).unwrap(), legacy);
+        assert_eq!(saved.assistant.messages[3].text, "New [[cite:v1:1]]");
+        assert_eq!(saved.assistant.messages[3].source_ids, ["source-b"]);
+        let history = history_input(&saved, &meeting).unwrap();
+        assert_eq!(history[1]["text"], "Legacy 【e1、e10】");
+        assert_eq!(history[3]["text"], "New ");
+        assert_eq!(serde_json::to_value(&saved).unwrap(), before);
     }
 
     #[tokio::test]

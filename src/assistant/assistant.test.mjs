@@ -6,7 +6,7 @@ import ts from 'typescript';
 // Compile the production pure helpers, not a second implementation or an SDK.
 const text = await readFile(new URL('./MeetingAssistant.tsx', import.meta.url), 'utf8');
 const tree = ts.createSourceFile('MeetingAssistant.tsx', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-const names = new Set(['captureAssistantContext', 'isAssistantContextAppend', 'assistantCoverageLabel', 'shouldSendAssistantKey', 'timestamp']);
+const names = new Set(['captureAssistantContext', 'isAssistantContextAppend', 'assistantCoverageLabel', 'shouldSendAssistantKey', 'assistantModelLabel', 'timestamp']);
 const source = tree.statements.filter(node => ts.isFunctionDeclaration(node) && names.has(node.name?.text))
   .map(node => node.getText(tree)).join('\n');
 const { outputText } = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } });
@@ -14,6 +14,12 @@ const helpers = await import(`data:text/javascript;base64,${Buffer.from(outputTe
 const capture = helpers.captureAssistantContext;
 const meeting = () => ({ id: 'a', title: 'Synthetic', language: 'ja-JP', updatedAt: 'before', durationSeconds: 20,
   hasAudio: false, transcript: [{ id: 's1', offsetSeconds: 5, text: 'Synthetic fact', speakerId: '0' }] });
+
+test('model picker labels Auto honestly and preserves all runtime-returned model IDs', () => {
+  assert.equal(helpers.assistantModelLabel({ id: 'auto', name: 'Auto' }), 'Auto — GitHub selects the model');
+  assert.equal(helpers.assistantModelLabel({ id: 'synthetic-model', name: 'Synthetic' }), 'Synthetic (synthetic-model)');
+  assert.match(text, /status\?\.models\.map\(candidate => <option key=\{candidate.id\} value=\{candidate.id\}>\{assistantModelLabel\(candidate\)\}/);
+});
 
 test('Copilot sharing is authorized only in the explicit submission handler, without a checkbox gate', () => {
   const asks = [];

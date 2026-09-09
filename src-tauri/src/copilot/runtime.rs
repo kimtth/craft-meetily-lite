@@ -1,9 +1,11 @@
-//! Official github-copilot-sdk 1.0.13 runtime. No shell or REST shim.
+//! Official github-copilot-sdk 1.0.13 inference/runtime. No inference REST shim.
+//! GitHub GET /user supplies identity metadata omitted by SDK token auth.
 //! Installed gh is used only to read local credentials, never for inference.
 //! Sources: https://github.com/github/copilot-sdk/blob/main/rust/README.md
 //! https://docs.rs/github-copilot-sdk/1.0.13/github_copilot_sdk/
-use super::schema::{CopilotModel, CopilotStatus, MAX_INPUT_BYTES, MAX_OUTPUT_BYTES};
+use super::schema::{validate_account, CopilotModel, CopilotStatus, MAX_INPUT_BYTES, MAX_OUTPUT_BYTES};
 use github_copilot_sdk::{Client, ClientMode, ClientOptions, CliProgram, LogLevel, Transport};
+use github_copilot_sdk::rpc::ModelsListRequest;
 use github_copilot_sdk::types::{InfiniteSessionConfig, MemoryConfiguration, MessageOptions, SessionConfig, SessionId, SystemMessageConfig};
 use serde_json::Value;
 use std::{ffi::OsString, path::{Path, PathBuf}, process::Stdio, time::Duration};
@@ -17,7 +19,11 @@ const TURN_TIMEOUT: Duration = Duration::from_secs(120);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const GH_TOKEN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_ACCOUNTS_BYTES: usize = 16 * 1024;
+const MAX_ACCOUNTS: usize = 100;
 const TOKEN_ENV_NAMES: [&str; 3] = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
+const SELECTED_AUTH_UNAVAILABLE: &str = "The selected GitHub CLI account credential is unavailable or invalid. Repair that account's local github.com login and retry; no other credential was used.";
+const AUTH_IDENTITY: &str = "Copilot did not confirm the selected GitHub account identity. Request blocked; no other account was used. Refresh account status and repair the selected login.";
 const AUTH_SETUP: &str = "No local GitHub credential is available. Set COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN before launching the app, or install GitHub CLI and run gh auth login --hostname github.com yourself, then retry. Copilot access is required; this app never opens a login browser.";
 const AUTH_INVALID: &str = "A local GitHub credential is malformed. Replace or unset the highest-priority token variable (COPILOT_GITHUB_TOKEN, then GH_TOKEN, then GITHUB_TOKEN), or repair your github.com GitHub CLI login, and retry. Credential values are never included in diagnostics.";
 
@@ -43,40 +49,112 @@ fn environment_token(mut lookup: impl FnMut(&str) -> Option<OsString>) -> Result
     Ok(None)
 }
 
-fn gh_token_command(home: &Path) -> Command {
+fn gh_command(home: &Path) -> Command {
     // Use the executable, not a .cmd/.bat wrapper or a shell. Keep the user's
     // HOME/GH_CONFIG_DIR so gh can read its own local login/keychain. An explicit
     // host prevents GH_HOST or the repository cwd selecting a different account.
     let mut command = Command::new(if cfg!(windows) { "gh.exe" } else { "gh" });
-    command.args(["auth", "token", "--hostname", "github.com"])
-        .current_dir(home)
+    command.current_dir(home)
         .env("GH_PROMPT_DISABLED", "1")
         .env_remove("GH_DEBUG")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    // Blank token variables already fell through the explicit selection above;
-    // ask gh for its stored credential, not another ambient token source.
-    for name in TOKEN_ENV_NAMES { command.env_remove(name); }
+    // Explicit account selection deliberately bypasses ambient tokens; default
+    // token lookup reaches gh only after blank/unset environment values.
+    // Enumeration also reads stored accounts, not ambient token identities.
+    for name in TOKEN_ENV_NAMES.into_iter().chain(["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "COPILOT_SDK_AUTH_TOKEN"]) {
+        command.env_remove(name);
+    }
     #[cfg(windows)]
     command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     command
 }
 
-async fn local_token(home: &Path) -> Result<String, &'static str> {
-    if let Some(token) = environment_token(|name| std::env::var_os(name))? { return Ok(token); }
+fn gh_token_command(home: &Path, account: Option<&str>) -> Result<Command, &'static str> {
+    validate_account(account)?;
+    let mut command = gh_command(home);
+    command.args(["auth", "token", "--hostname", "github.com"]);
+    if let Some(account) = account { command.args(["--user", account]); }
+    Ok(command)
+}
+
+fn gh_accounts_command(home: &Path) -> Command {
+    let mut command = gh_command(home);
+    // Only the projected login array reaches stdout; never capture raw hosts,
+    // tokens, stderr, or debug output. This command is not used by inference.
+    command.args(["auth", "status", "--hostname", "github.com", "--json", "hosts", "--jq",
+        "[.hosts[\"github.com\"][]?.login | select(type == \"string\")]"]);
+    command
+}
+
+async fn bounded_output(mut command: Command, limit: usize) -> Result<Vec<u8>, &'static str> {
+    let mut child = command.spawn().map_err(|_| AUTH_SETUP)?;
+    let stdout = child.stdout.take().ok_or(AUTH_SETUP)?;
+    let mut bytes = Vec::new();
+    stdout.take((limit + 1) as u64).read_to_end(&mut bytes).await.map_err(|_| AUTH_SETUP)?;
+    if bytes.len() > limit { return Err(AUTH_INVALID); }
+    if !child.wait().await.map_err(|_| AUTH_SETUP)?.success() { return Err(AUTH_SETUP); }
+    Ok(bytes)
+}
+
+fn parse_accounts(bytes: &[u8]) -> Vec<String> {
+    if bytes.len() > MAX_ACCOUNTS_BYTES { return Vec::new(); }
+    let Ok(mut accounts) = serde_json::from_slice::<Vec<String>>(bytes) else { return Vec::new(); };
+    if accounts.len() > MAX_ACCOUNTS { return Vec::new(); }
+    accounts.retain(|login| validate_account(Some(login)).is_ok());
+    accounts.sort_by_key(|login| login.to_ascii_lowercase());
+    accounts.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    accounts
+}
+
+// Called ONLY by the explicit copilot_status IPC, not startup or ask_copilot.
+// Failure of this optional picker must not block credential/auth status.
+pub(super) async fn local_accounts() -> Vec<String> {
+    accounts_from_lookup(bounded_output(gh_accounts_command(&std::env::temp_dir()), MAX_ACCOUNTS_BYTES), GH_TOKEN_TIMEOUT).await
+}
+
+async fn accounts_from_lookup(
+    lookup: impl std::future::Future<Output = Result<Vec<u8>, &'static str>>,
+    budget: Duration,
+) -> Vec<String> {
+    match timeout(budget, lookup).await {
+        Ok(Ok(bytes)) => parse_accounts(&bytes),
+        _ => Vec::new(),
+    }
+}
+
+struct Credential { token: String, source: String }
+
+// Injected dependencies prove explicit choice bypasses even malformed ambient
+// tokens, and errors never fall back to another account. Never derive Debug.
+async fn resolve_credential<F, Fut>(account: Option<&str>, mut lookup: impl FnMut(&str) -> Option<OsString>, gh: F)
+    -> Result<Credential, &'static str>
+where
+    F: FnOnce(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<String, &'static str>>,
+{
+    validate_account(account)?;
+    if let Some(account) = account {
+        let token = gh(Some(account.to_owned())).await.map_err(|_| SELECTED_AUTH_UNAVAILABLE)?;
+        return Ok(Credential { token, source: format!("gh:github.com:{account}") });
+    }
+    let mut source = String::new();
+    if let Some(token) = environment_token(|name| {
+        source = format!("env:{name}");
+        lookup(name)
+    })? { return Ok(Credential { token, source }); }
+    Ok(Credential { token: gh(None).await?, source: "gh:github.com:active".into() })
+}
+
+async fn local_gh_token(home: &Path, account: Option<&str>) -> Result<String, &'static str> {
+    let command = gh_token_command(home, account)?;
     // auth token is a local config/keychain read; no login, refresh or API call.
     // The timeout owns the child: cancellation/timeouts drop it and kill it.
     // Bound stdout as well as time; discard stderr without ever capturing logs.
     timeout(GH_TOKEN_TIMEOUT, async {
-        let mut child = gh_token_command(home).spawn().map_err(|_| AUTH_SETUP)?;
-        let stdout = child.stdout.take().ok_or(AUTH_SETUP)?;
-        let mut bytes = Vec::new();
-        stdout.take((MAX_TOKEN_BYTES + 1) as u64).read_to_end(&mut bytes)
-            .await.map_err(|_| AUTH_SETUP)?;
-        if bytes.len() > MAX_TOKEN_BYTES { return Err(AUTH_INVALID); }
-        if !child.wait().await.map_err(|_| AUTH_SETUP)?.success() { return Err(AUTH_SETUP); }
+        let bytes = bounded_output(command, MAX_TOKEN_BYTES).await?;
         normalize_token(String::from_utf8(bytes).map_err(|_| AUTH_INVALID)?)?.ok_or(AUTH_SETUP)
     }).await.map_err(|_| "Local GitHub CLI credential lookup timed out after 5 seconds. Repair your gh login or set COPILOT_GITHUB_TOKEN before launching the app, then retry.")?
 }
@@ -86,6 +164,56 @@ pub(super) struct Runtime {
     client: Option<Client>,
     directory: Option<TempDir>,
     auth_unavailable: Option<&'static str>,
+    // Same credential as ClientOptions, retained only in memory for account-
+    // scoped discovery. Never derive Debug or log token-bearing RPC requests.
+    token: Option<String>,
+    credential_source: Option<String>,
+    selected_account: Option<String>,
+    token_login: tokio::sync::OnceCell<String>,
+}
+
+fn identity_login(bytes: &[u8]) -> Result<String, &'static str> {
+    if bytes.len() > 64 * 1024 { return Err(AUTH_IDENTITY); }
+    #[derive(serde::Deserialize)]
+    struct Identity { login: String }
+    let identity: Identity = serde_json::from_slice(bytes).map_err(|_| AUTH_IDENTITY)?;
+    validate_account(Some(&identity.login)).map_err(|_| AUTH_IDENTITY)?;
+    Ok(identity.login)
+}
+
+async fn github_token_login(token: &str) -> Result<String, &'static str> {
+    timeout(RPC_TIMEOUT, async {
+        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+            .timeout(RPC_TIMEOUT).build().map_err(|_| AUTH_IDENTITY)?;
+        let mut response = client.get("https://api.github.com/user")
+            .header("User-Agent", "Meetly-Lite")
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .bearer_auth(token).send().await.map_err(|_| AUTH_IDENTITY)?;
+        if !response.status().is_success() { return Err(AUTH_IDENTITY); }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| AUTH_IDENTITY)? {
+            if bytes.len() + chunk.len() > 64 * 1024 { return Err(AUTH_IDENTITY); }
+            bytes.extend_from_slice(&chunk);
+        }
+        identity_login(&bytes)
+    }).await.map_err(|_| AUTH_IDENTITY)?
+}
+
+fn verified_identity(authenticated: bool, login: Option<&str>, selected: Option<&str>) -> Result<Option<String>, &'static str> {
+    let login = login.filter(|login| validate_account(Some(login)).is_ok());
+    if let Some(selected) = selected {
+        validate_account(Some(selected))?;
+        if !authenticated || !login.is_some_and(|login| login.eq_ignore_ascii_case(selected)) {
+            return Err(AUTH_IDENTITY);
+        }
+    }
+    if !authenticated { return Err("The selected local GitHub credential was not accepted. Replace or unset stale token variables (COPILOT_GITHUB_TOKEN takes precedence over GH_TOKEN and GITHUB_TOKEN), or run gh auth login --hostname github.com yourself, then retry. Verify that the account has Copilot access; this app never opens a login browser."); }
+    Ok(login.map(str::to_owned))
+}
+
+fn model_list_request(token: &str) -> ModelsListRequest {
+    ModelsListRequest { git_hub_token: Some(token.to_owned()), selection_id: None }
 }
 
 fn options(home: &Path, program: PathBuf, token: Option<String>, env_names: impl IntoIterator<Item = OsString>) -> ClientOptions {
@@ -174,7 +302,9 @@ fn session_config(home: &Path, model: &str, instructions: &str) -> SessionConfig
 }
 
 impl Runtime {
-    pub(super) async fn start() -> Result<Self, String> {
+    pub(super) async fn start(account: Option<&str>) -> Result<Self, String> {
+        // Reject invalid selection before extraction, environment reads or gh.
+        validate_account(account)?;
         // Extraction is SDK-managed, local only, and off the async executor.
         // Explicit path prevents COPILOT_CLI_PATH or a PATH shim from winning.
         let program = tokio::task::spawn_blocking(github_copilot_sdk::install_bundled_runtime)
@@ -184,45 +314,80 @@ impl Runtime {
             .map_err(|_| "Could not create isolated Copilot directory")?;
         std::fs::create_dir(directory.path().join("empty-plugins"))
             .map_err(|_| "Could not isolate Copilot plugins")?;
-        let (token, auth_unavailable) = match local_token(directory.path()).await {
-            Ok(token) => (Some(token), None),
-            Err(detail) => (None, Some(detail)),
+        let home = directory.path();
+        let (token, credential_source, auth_unavailable) = match resolve_credential(
+            account, |name| std::env::var_os(name),
+            |selected| async move { local_gh_token(home, selected.as_deref()).await },
+        ).await {
+            Ok(credential) => (Some(credential.token), Some(credential.source), None),
+            Err(detail) => (None, account.map(|login| format!("gh:github.com:{login}")), Some(detail)),
         };
         // Missing auth must not prevent the local runtime handshake. status()
         // reports actionable local setup guidance without attempting auth RPCs.
-        let options = options(directory.path(), program, token, std::env::vars_os().map(|(key, _)| key));
+        let options = options(directory.path(), program, token.clone(), std::env::vars_os().map(|(key, _)| key));
         let client = timeout(RPC_TIMEOUT, Client::start(options))
             .await.map_err(|_| "Copilot runtime startup timed out")?
             .map_err(|_| "Copilot runtime could not start; verify bundled runtime and account setup")?;
-        Ok(Self { client: Some(client), directory: Some(directory), auth_unavailable })
+        Ok(Self { client: Some(client), directory: Some(directory), auth_unavailable, token,
+            credential_source, selected_account: account.map(str::to_owned), token_login: tokio::sync::OnceCell::new() })
     }
 
-    pub(super) async fn status(&self) -> CopilotStatus {
-        if let Some(detail) = self.auth_unavailable { return CopilotStatus::unavailable(detail); }
+    async fn identity(&self) -> Result<Option<String>, &'static str> {
+        if let Some(detail) = self.auth_unavailable { return Err(detail); }
         let client = self.client.as_ref().expect("runtime open");
         let auth = match timeout(RPC_TIMEOUT, client.get_auth_status()).await {
             Ok(Ok(auth)) => auth,
-            _ => return CopilotStatus::unavailable("Copilot authentication status is unavailable or timed out"),
+            _ => return Err("Copilot authentication status is unavailable or timed out"),
         };
-        if !auth.is_authenticated {
-            return CopilotStatus::unavailable("The selected local GitHub credential was not accepted. Replace or unset stale token variables (COPILOT_GITHUB_TOKEN takes precedence over GH_TOKEN and GITHUB_TOKEN), or run gh auth login --hostname github.com yourself, then retry. Verify that the account has Copilot access; this app never opens a login browser.");
+        let mut login = auth.login;
+        if auth.is_authenticated && login.is_none() {
+            let token = self.token.as_deref().ok_or(AUTH_SETUP)?;
+            match self.token_login.get_or_try_init(|| github_token_login(token)).await {
+                Ok(value) => login = Some(value.clone()),
+                Err(error) if self.selected_account.is_some() => return Err(error),
+                Err(_) => {}, // Default auth can remain usable with unknown identity.
+            }
         }
-        let models = match timeout(RPC_TIMEOUT, client.list_models()).await {
-            Ok(Ok(models)) => models,
-            _ => return CopilotStatus { authenticated: true, models: Vec::new(),
-                detail: "Authenticated, but model discovery failed or timed out; verify Copilot entitlement and network access".into() },
+        verified_identity(auth.is_authenticated, login.as_deref(), self.selected_account.as_deref())
+    }
+
+    pub(super) async fn status(&self) -> CopilotStatus {
+        let mut status = CopilotStatus::unavailable(AUTH_SETUP);
+        status.credential_source = self.credential_source.clone();
+        status.login = match self.identity().await {
+            Ok(login) => login,
+            Err(detail) => { status.detail = detail.into(); return status; }
+        };
+        let Some(token) = self.token.as_deref() else { return status; };
+        status.authenticated = true;
+        let client = self.client.as_ref().expect("runtime open");
+        // Explicitly scope discovery to the same credential as inference, not
+        // an ambient account. Pinned SDK 1.0.13 / bundled runtime 1.0.83.
+        // This does not override server-side model_picker_enabled filtering.
+        let models = match timeout(RPC_TIMEOUT, client.rpc().models().list_with_params(model_list_request(token))).await {
+            Ok(Ok(result)) => result.models,
+            _ => {
+                status.detail = "Authenticated, but model discovery failed or timed out; verify Copilot entitlement and network access".into();
+                return status;
+            }
         };
         let mut models: Vec<_> = models.into_iter().map(|model| CopilotModel { id: model.id, name: model.name }).collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models.dedup_by(|a, b| a.id == b.id);
-        CopilotStatus { authenticated: true,
-            detail: if models.is_empty() { "Authenticated, but no models are available".into() }
-                else { "Authenticated. Listed models are service-advertised; entitlement and policy are enforced when invoked. No inference was performed by this status check.".into() },
-            models }
+        status.detail = if models.is_empty() { "Authenticated, but no models are available".into() }
+            else if models.iter().all(|model| model.id == "auto") {
+                "This GitHub Copilot SDK connection currently offers only Auto. GitHub selects the model; manual model selection is unavailable here. Available models can differ from Copilot in VS Code or on the web. No inference was performed.".into()
+            } else { "Authenticated. Models were queried for the same GitHub credential used for inference; this SDK surface may differ from other Copilot products. Entitlement and policy are enforced when invoked. No inference was performed by this status check.".into() };
+        status.models = models;
+        status
     }
 
     pub(super) async fn generate(&self, model: &str, instructions: &str, input: Value) -> Result<String, String> {
         if let Some(detail) = self.auth_unavailable { return Err(detail.into()); }
+        // Every selected-account turn (including chunks/retries) rechecks SDK
+        // identity BEFORE creating a session or sending any meeting content.
+        // Default behavior is unchanged: ask_copilot already checks status.
+        if self.selected_account.is_some() { self.identity().await?; }
         let prompt = serde_json::to_string(&input).map_err(|_| "Could not encode assistant request")?;
         if prompt.len() + instructions.len() > MAX_INPUT_BYTES {
             return Err("Assistant context exceeds the 96000-byte budget; nothing was silently truncated".into());
@@ -285,6 +450,166 @@ mod tests {
     use super::*;
 
     #[test]
+    fn identity_metadata_is_bounded_validated_and_not_an_auth_response_dump() {
+        assert_eq!(identity_login(br#"{"login":"synthetic_managed","other":"ignored"}"#).unwrap(), "synthetic_managed");
+        for value in [br#"{"login":"bad\nlogin"}"#.as_slice(), br#"{"token":"not-identity"}"#, b"invalid"] {
+            assert_eq!(identity_login(value), Err(AUTH_IDENTITY));
+        }
+        assert_eq!(identity_login(&vec![b' '; 65537]), Err(AUTH_IDENTITY));
+    }
+
+    #[tokio::test]
+    async fn explicit_account_bypasses_environment_and_never_falls_back() {
+        let credential = resolve_credential(Some("synthetic_managed"),
+            |_| panic!("Explicit selection must not read token environment"),
+            |account| {
+                assert_eq!(account.as_deref(), Some("synthetic_managed"));
+                std::future::ready(Ok("synthetic-selected-token".into()))
+            }).await.unwrap_or_else(|_| panic!("Synthetic resolution failed"));
+        assert_eq!(credential.token, "synthetic-selected-token");
+        assert_eq!(credential.source, "gh:github.com:synthetic_managed");
+        for error in [AUTH_SETUP, AUTH_INVALID, "PRIVATE SYNTHETIC STDERR"] {
+            let mut calls = 0;
+            let result = resolve_credential(Some("synthetic_managed"),
+                |_| panic!("Selected-account failure must never read environment"),
+                |account| {
+                    calls += 1;
+                    assert_eq!(account.as_deref(), Some("synthetic_managed"));
+                    std::future::ready(Err(error))
+                }).await;
+            assert!(matches!(result, Err(SELECTED_AUTH_UNAVAILABLE)));
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_account_rejected_before_any_credential_lookup_or_runtime_start() {
+        for invalid in ["", " ", "-flag", "--user=other", "a b", "a\nb", "a\0b", "../other",
+            "x;whoami", "x&y", "한글", "ａｂｃ", "a@b", "_managed", "a-", "a_"] {
+            let result = resolve_credential(Some(invalid),
+                |_| panic!("Invalid selection must not read environment"),
+                |_| { panic!("Invalid selection must not run gh");
+                    #[allow(unreachable_code)] std::future::ready(Err(AUTH_SETUP)) }).await;
+            assert!(result.is_err());
+            assert!(gh_token_command(Path::new("isolated"), Some(invalid)).is_err());
+            assert!(Runtime::start(Some(invalid)).await.is_err());
+        }
+        assert!(validate_account(Some(&"a".repeat(101))).is_err());
+        for valid in ["a", "synthetic-user", "synthetic_managed", &"a".repeat(100)] {
+            assert!(validate_account(Some(valid)).is_ok());
+        }
+        assert!(validate_account(None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn default_resolution_keeps_precedence_and_reports_actual_source() {
+        for (index, expected) in TOKEN_ENV_NAMES.into_iter().enumerate() {
+            let credential = resolve_credential(None, |name| {
+                let position = TOKEN_ENV_NAMES.iter().position(|candidate| *candidate == name).unwrap();
+                assert!(position <= index, "No lower-priority credential should be read");
+                Some(if position == index { "synthetic-token" } else { " \r\n" }.into())
+            }, |_| { panic!("Environment token must bypass gh");
+                #[allow(unreachable_code)] std::future::ready(Err(AUTH_SETUP)) }).await
+                .unwrap_or_else(|_| panic!("Synthetic resolution failed"));
+            assert_eq!(credential.source, format!("env:{expected}"));
+            assert_eq!(credential.token, "synthetic-token");
+        }
+        let credential = resolve_credential(None, |_| None, |account| {
+            assert!(account.is_none());
+            std::future::ready(Ok("synthetic-active".into()))
+        }).await.unwrap_or_else(|_| panic!("Synthetic resolution failed"));
+        assert_eq!(credential.source, "gh:github.com:active");
+        assert_eq!(credential.token, "synthetic-active");
+        let result = resolve_credential(None, |_| Some("invalid token".into()),
+            |_| { panic!("Malformed environment must not fall back to gh");
+                #[allow(unreachable_code)] std::future::ready(Err(AUTH_SETUP)) }).await;
+        assert!(matches!(result, Err(AUTH_INVALID)));
+        assert!(matches!(resolve_credential(None, |_| None,
+            |_| std::future::ready(Err(AUTH_SETUP))).await, Err(AUTH_SETUP)));
+    }
+
+    #[test]
+    fn selected_account_commands_are_scoped_and_enumeration_projects_only_names() {
+        let token = gh_token_command(Path::new("isolated"), Some("synthetic_managed")).unwrap();
+        assert_eq!(token.as_std().get_args().collect::<Vec<_>>(),
+            ["auth", "token", "--hostname", "github.com", "--user", "synthetic_managed"]);
+        let accounts = gh_accounts_command(Path::new("isolated"));
+        assert_eq!(accounts.as_std().get_args().collect::<Vec<_>>(),
+            ["auth", "status", "--hostname", "github.com", "--json", "hosts", "--jq",
+             "[.hosts[\"github.com\"][]?.login | select(type == \"string\")]"]);
+        for command in [token, accounts] {
+            let command = command.as_std();
+            assert_eq!(command.get_program(), if cfg!(windows) { "gh.exe" } else { "gh" });
+            let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+            for name in TOKEN_ENV_NAMES.into_iter().chain(["GH_DEBUG", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "COPILOT_SDK_AUTH_TOKEN"]) {
+                assert_eq!(env.get(std::ffi::OsStr::new(name)), Some(&None));
+            }
+            assert!(!command.get_args().any(|arg| arg == "switch" || arg == "login" || arg == "logout"));
+        }
+    }
+
+    #[test]
+    fn account_enumeration_is_bounded_sanitized_and_case_insensitively_deduplicated() {
+        assert_eq!(parse_accounts(br#"["z-user","Synthetic_managed","synthetic_managed","a","bad login","--flag","","private\ntext"]"#),
+            ["a", "Synthetic_managed", "z-user"]);
+        for malformed in [b"not json".as_slice(), br#"{"hosts":{"github.com":[]}}"#, br#"[null,42]"#, &[0xff]] {
+            assert!(parse_accounts(malformed).is_empty());
+        }
+        assert!(parse_accounts(&vec![b' '; MAX_ACCOUNTS_BYTES + 1]).is_empty());
+        let many = serde_json::to_vec(&vec!["synthetic"; MAX_ACCOUNTS + 1]).unwrap();
+        assert!(parse_accounts(&many).is_empty());
+    }
+
+    #[tokio::test]
+    async fn optional_account_lookup_errors_and_timeout_leave_credential_status_unchanged() {
+        for lookup in [Err(AUTH_SETUP), Err(AUTH_INVALID), Err("PRIVATE SYNTHETIC ERROR"),
+            Ok(b"not json".to_vec())] {
+            let mut status = CopilotStatus { authenticated: true, detail: "Synthetic status".into(),
+                models: vec![CopilotModel { id: "auto".into(), name: "Auto".into() }],
+                login: Some("synthetic".into()), credential_source: Some("env:GH_TOKEN".into()),
+                accounts: Vec::new() };
+            let before = serde_json::to_value(&status).unwrap();
+            status.accounts = accounts_from_lookup(std::future::ready(lookup), GH_TOKEN_TIMEOUT).await;
+            assert_eq!(serde_json::to_value(&status).unwrap(), before);
+        }
+        // Pending future has no process, environment access or network traffic.
+        let accounts = accounts_from_lookup(std::future::pending(), Duration::from_millis(1)).await;
+        assert!(accounts.is_empty());
+        assert_eq!(accounts_from_lookup(std::future::ready(Ok(br#"["synthetic"]"#.to_vec())),
+            GH_TOKEN_TIMEOUT).await, ["synthetic"]);
+    }
+
+    #[test]
+    fn explicit_identity_requires_authenticated_safe_matching_sdk_login() {
+        for (authenticated, login) in [(false, Some("synthetic_managed")), (true, None),
+            (true, Some("")), (true, Some("different")), (true, Some("private\nresponse"))] {
+            assert!(matches!(verified_identity(authenticated, login, Some("synthetic_managed")), Err(AUTH_IDENTITY)));
+        }
+        assert_eq!(verified_identity(true, Some("Synthetic_managed"), Some("synthetic_managed")).unwrap(),
+            Some("Synthetic_managed".into()));
+        // Missing identity did not block default auth previously; preserve it.
+        assert_eq!(verified_identity(true, None, None).unwrap(), None);
+        assert_eq!(verified_identity(true, Some("bad\nresponse"), None).unwrap(), None);
+        assert_eq!(verified_identity(true, Some("synthetic-active"), None).unwrap(), Some("synthetic-active".into()));
+        assert!(verified_identity(false, Some("synthetic-active"), None).is_err());
+    }
+
+    #[tokio::test]
+    async fn selected_credential_failure_preserves_source_but_never_authenticates_or_generates() {
+        let runtime = Runtime { client: None, directory: None, auth_unavailable: Some(SELECTED_AUTH_UNAVAILABLE),
+            token: None, credential_source: Some("gh:github.com:synthetic_managed".into()),
+            selected_account: Some("synthetic_managed".into()), token_login: tokio::sync::OnceCell::new() };
+        let status = runtime.status().await;
+        assert!(!status.authenticated);
+        assert_eq!(status.login, None);
+        assert_eq!(status.credential_source.as_deref(), Some("gh:github.com:synthetic_managed"));
+        assert!(status.accounts.is_empty());
+        assert!(status.models.is_empty());
+        assert_eq!(runtime.generate("synthetic", "synthetic", Value::Null).await.unwrap_err(), SELECTED_AUTH_UNAVAILABLE);
+        runtime.close().await.unwrap();
+    }
+
+    #[test]
     fn token_environment_precedence_and_blank_fallback_are_synthetic() {
         for (values, expected) in [
             ([Some(" synthetic-copilot "), Some("synthetic-gh"), Some("synthetic-github")], Some("synthetic-copilot")),
@@ -322,7 +647,7 @@ mod tests {
     #[test]
     fn gh_lookup_is_a_local_noninteractive_executable_command() {
         // Inspect only a command built with synthetic paths; never spawn gh.
-        let command = gh_token_command(Path::new("isolated"));
+        let command = gh_token_command(Path::new("isolated"), None).unwrap();
         let command = command.as_std();
         assert_eq!(command.get_program(), if cfg!(windows) { "gh.exe" } else { "gh" });
         assert_eq!(command.get_args().collect::<Vec<_>>(), ["auth", "token", "--hostname", "github.com"]);
@@ -410,7 +735,8 @@ mod tests {
     #[tokio::test]
     async fn missing_local_credentials_return_guidance_without_any_client() {
         // No process, actual environment, RPC or network is involved.
-        let runtime = Runtime { client: None, directory: None, auth_unavailable: Some(AUTH_SETUP) };
+        let runtime = Runtime { client: None, directory: None, auth_unavailable: Some(AUTH_SETUP), token: None,
+            credential_source: None, selected_account: None, token_login: tokio::sync::OnceCell::new() };
         let status = runtime.status().await;
         assert!(!status.authenticated);
         assert!(status.models.is_empty());
@@ -420,6 +746,40 @@ mod tests {
         assert!(runtime.close().await.is_ok());
     }
 
+    #[test]
+    fn model_discovery_is_explicitly_scoped_to_the_selected_credential() {
+        let request = model_list_request("synthetic-model-token");
+        let wire = serde_json::to_value(request).unwrap();
+        assert_eq!(wire, serde_json::json!({"gitHubToken":"synthetic-model-token"}));
+        let options = options(Path::new("isolated"), "bundled-runtime".into(), Some("synthetic-model-token".into()), Vec::new());
+        assert_eq!(options.github_token.as_deref(), wire["gitHubToken"].as_str());
+        assert_eq!(options.mode, ClientMode::Empty);
+        assert_eq!(options.use_logged_in_user, Some(false));
+    }
+
+    /// Explicit opt-in only: contacts GitHub for account/model metadata, never
+    /// creates a session or sends a transcript/prompt. Logs IDs, not auth data.
+    #[tokio::test]
+    #[ignore = "NETWORK METADATA ONLY: requires user approval to check GitHub authentication and model catalog"]
+    async fn approved_account_model_catalog_metadata_only() {
+        let account = std::env::var("MEETLY_TEST_GITHUB_ACCOUNT").ok();
+        let runtime = Runtime::start(account.as_deref()).await.unwrap_or_else(|detail| panic!("{detail}"));
+        let status = runtime.status().await;
+        let closed = runtime.close().await;
+        println!("Selected-credential model IDs: {}", status.models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>().join(", "));
+        println!("Catalog status: {}", status.detail);
+        println!("Connected login: {}", status.login.as_deref().unwrap_or("unavailable"));
+        assert!(closed.is_ok(), "Metadata-check runtime cleanup failed");
+        assert!(status.authenticated, "Metadata authentication failed; see sanitized status");
+        // Auto alone is a valid restricted catalog, not evidence that manual
+        // selection is available. This smoke test does not prove entitlement.
+        assert!(!status.models.is_empty(), "No account models returned");
+        if let Some(account) = account {
+            assert!(status.login.as_deref().is_some_and(|login| login.eq_ignore_ascii_case(&account)), "Account identity mismatch");
+            assert!(status.models.iter().any(|model| model.id != "auto"), "Selected-account regression: no manually selectable models returned");
+        }
+    }
+
     /// LOCAL-ONLY, opt-in transport smoke. It reads local credentials at startup
     /// but never checks auth, lists models, creates sessions or sends inference.
     /// SDK startup + ping + close only; telemetry uses the production off policy.
@@ -427,7 +787,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "LOCAL-ONLY: explicitly run local_bundled_runtime_handshake; starts the bundled runtime and reads local credentials"]
     async fn local_bundled_runtime_handshake() {
-        let runtime = Runtime::start().await.unwrap_or_else(|detail| panic!("{detail}"));
+        let runtime = Runtime::start(None).await.unwrap_or_else(|detail| panic!("{detail}"));
         let home = runtime.directory.as_ref().expect("runtime directory").path().to_path_buf();
         // Save only success, never an SDK response/error which might carry
         // sensitive details. Always close even when the ping fails or times out.

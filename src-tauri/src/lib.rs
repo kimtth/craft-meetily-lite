@@ -318,6 +318,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             copilot::copilot_status,
             copilot::get_meeting_assistant,
+            copilot::clear_meeting_assistant,
             copilot::ask_copilot,
             copilot::set_action_item_done,
             speakers::rename_speaker,
