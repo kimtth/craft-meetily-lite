@@ -3,7 +3,7 @@ title: Meetly Lite Architecture
 description: Architecture, native API, and build guidance for Meetly Lite
 ---
 
-Meetly Lite is generated at the workspace root. The reference project in `ref-meetily/` is read-only input and must not be modified.
+Meetly Lite lives at the workspace root. The reference project in `ref-meetily/` is read-only input and must not be modified.
 
 ## Features
 
@@ -35,6 +35,35 @@ aligned with saved audio. Stateful resampling preserves fractional samples. Azur
 offsets are anchored to delivered PCM after reconnects or language changes; Foundry
 captures the language when each utterance is queued.
 
+Recording devices remain paused until metadata and the dedicated WAV writer
+thread are ready. The capture clock begins when streams are started, so slow
+setup does not consume the two-second per-source buffer or add startup silence.
+WAV writes and finalization do not run on the shared async executor. Genuine
+capture overflow or disk failure still stops recording and retains recovery audio.
+
+WASAPI's first callback timestamp can be zero while the packet's capture timestamp
+is valid system QPC time. The shared anchor uses the later of those timestamps at
+the observed elapsed time, not zero/system boot time. Subsequent packets retain
+capture-time deltas (including real pauses and late delivery). Impossible future
+jumps beyond 250 ms stop capture rather than generating hours of invalid silence.
+
+Azure shutdown closes the owned push stream, waits for end-of-input results and
+transcript persistence, then disposes the recognizer. It does not redundantly close
+the AudioConfig wrapper. Real drain/disposal errors remain visible.
+
+Opening an idle saved meeting is a local view change with no native runtime-query
+wait. Selection reveals the meeting workspace even when the same meeting ID is
+already selected beneath Settings or another workspace. Startup reconciliation
+remains responsible for restoring a native session; settings/device initialization
+alone is not a recording.
+
+Active capture and stale capture references use guarded native status checks and
+serialized cleanup before switching meetings. Start/stop transitions block a switch
+to another meeting, stale selection responses are ignored, and status-query failures
+preserve live capture. UI Stop callbacks take no arguments, while internal failure
+cleanup is bound to a recording attempt so stale events cannot stop a replacement
+session.
+
 ### Meeting Assistant
 
 * **Runtime:** the pinned Copilot Rust SDK uses a bundled runtime over stdio, with
@@ -61,7 +90,7 @@ Azure re-transcription requires explicit audio-upload consent and creates a new
 meeting, preserving the original. Speaker IDs are anonymous labels, not verified
 identities. Editing a saved meeting's language changes metadata only.
 
-## Current Implementation Slice
+## Application Structure
 
 The current root implementation is a Vite and React frontend wrapped by a
 Windows-first Tauri application. The backend is the Rust core under
@@ -70,9 +99,8 @@ Windows-first Tauri application. The backend is the Rust core under
 
 ## Backend Boundary
 
-The active backend lives under `src-tauri/` at the workspace root. The older
-Node.js file-store backend was removed because it did not perform native audio
-capture or transcription.
+The active backend lives under `src-tauri/` at the workspace root and owns native
+capture, local persistence, and recording lifecycle commands.
 
 ```mermaid
 flowchart TD
@@ -187,14 +215,6 @@ The root Tauri backend provides these commands to the frontend:
 * `resume_playback`
 * `set_mini_mode`
 
-## Validation Status
-
-The following checks pass:
-
-* `npm run build`
-* `cargo check --manifest-path src-tauri\Cargo.toml`
-* `cargo test --manifest-path src-tauri\Cargo.toml --lib`
-
 ## Azure Speech Fast Transcription
 
 Fast Transcription accepts one WAV, MP3, or MP4 file. Before upload, the native
@@ -267,7 +287,7 @@ flowchart TD
 	Stop --> Files
 ```
 
-## Removed From Scope
+## Scope Exclusions
 
 The lightweight version excludes these reference-project capabilities:
 
