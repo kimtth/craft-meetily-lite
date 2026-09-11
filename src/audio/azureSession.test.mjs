@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
+import * as InstalledSpeechSDK from 'microsoft-cognitiveservices-speech-sdk';
 
 // Run with node --test src/audio/azureSession.test.mjs. Like timing.test.mjs,
 // transpile the actual TS in memory. CommonJS + a VM require allowlist mocks
@@ -47,9 +48,19 @@ function harness(behavior = {}) {
   const timers = new Set();
   let recognizer;
   let config;
-  const pushStream = {
-    write(bytes) { writes.push(Buffer.from(bytes)); calls.push('write'); },
-    close() { calls.push('input.close'); behavior.onInputClose?.(recognizer); },
+  // Optionally exercise the installed SDK audio objects, but NEVER its real
+  // recognizer/token/network path. This catches defects hidden by simple mocks.
+  const pushStream = behavior.realAudio
+    ? InstalledSpeechSDK.AudioInputStream.createPushStream(
+      InstalledSpeechSDK.AudioStreamFormat.getWaveFormatPCM(16000, 16, 1))
+    : { write() {}, close() {} };
+  const writeInput = pushStream.write.bind(pushStream);
+  const closeInput = pushStream.close.bind(pushStream);
+  pushStream.write = (bytes) => {
+    writes.push(Buffer.from(bytes)); calls.push('write'); writeInput(bytes);
+  };
+  pushStream.close = () => {
+    calls.push('input.close'); closeInput(); behavior.onInputClose?.(recognizer);
   };
   const sdk = {
     ResultReason: { RecognizedSpeech: 1 },
@@ -65,7 +76,12 @@ function harness(behavior = {}) {
     AudioConfig: {
       fromStreamInput(input) {
         assert.equal(input, pushStream);
-        return { close() { calls.push('audio.close'); behavior.onAudioClose?.(); } };
+        const audio = behavior.realAudio
+          ? InstalledSpeechSDK.AudioConfig.fromStreamInput(input)
+          : { close() {} };
+        const closeAudio = audio.close.bind(audio);
+        audio.close = (...args) => { calls.push('audio.close'); closeAudio(...args); };
+        return audio;
       },
     },
     SpeechRecognizer: class {
@@ -132,7 +148,7 @@ function harness(behavior = {}) {
     assertDisposed() {
       assert.equal(calls.filter((call) => call === 'input.close').length, 1);
       assert.equal(calls.filter((call) => call === 'recognizer.close').length, 1);
-      assert.equal(calls.filter((call) => call === 'audio.close').length, 1);
+      assert.equal(calls.filter((call) => call === 'audio.close').length, 0);
       assert.ok(!calls.includes('forced.stop'));
       assert.equal(timers.size, 0);
     },
@@ -193,6 +209,24 @@ test('synchronous EOF/sessionStopped during input close is race-safe and idempot
   const first = session.stop();
   assert.equal(first, session.stop());
   await first;
+  h.assertDisposed();
+});
+
+test('installed SDK push stream stops without the broken redundant AudioConfig close', async () => {
+  const h = harness({
+    realAudio: true,
+    onInputClose(recognizer) {
+      recognizer.canceled(recognizer, { reason: 1 });
+      recognizer.sessionStopped(recognizer, {});
+    },
+  });
+  const saved = [];
+  const session = await h.start({ onFinalText: (text) => { saved.push(text); } });
+  session.pushPcmBase64(Buffer.alloc(640).toString('base64'), 0);
+  h.final('synthetic final');
+  await session.stop();
+  assert.deepEqual(saved, ['synthetic final']);
+  assert.deepEqual(h.errors, []);
   h.assertDisposed();
 });
 
@@ -375,7 +409,7 @@ test('input close failure rejects as incomplete and still disposes', async () =>
   h.assertDisposed();
 });
 
-test('disposal callback failure still closes audio config and rejects stop', async () => {
+test('disposal callback failure rejects stop without redundant audio config cleanup', async () => {
   const h = harness({ onDispose: (_, __, reject) => reject('dispose failed') });
   const session = await h.start();
   const stopped = session.stop();
@@ -386,7 +420,7 @@ test('disposal callback failure still closes audio config and rejects stop', asy
   h.assertDisposed();
 });
 
-test('stalled disposal is bounded and still releases audio config', async () => {
+test('stalled disposal is bounded with the owned input stream already closed', async () => {
   const h = harness({ onDispose() {} });
   const session = await h.start();
   const stopped = session.stop();
