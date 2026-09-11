@@ -166,9 +166,11 @@ export async function startAzureSpeechSession(options: AzureSpeechOptions): Prom
           }), DISPOSE_TIMEOUT_MS, 'Timed out disposing the speech recognizer.');
         } catch (error) {
           recordFailure(error);
-        } finally {
-          try { audioConfig.close(); } catch (error) { recordFailure(error); }
         }
+        // The owned push stream is already closed and the recognizer disposed.
+        // Do not also close the AudioConfig wrapper: Speech SDK 1.51 calls
+        // source.turnOff().then(), but its push source returns undefined. That
+        // redundant cleanup throws even after a completely successful drain.
       }
       if (failure) throw failure;
     });

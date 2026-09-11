@@ -84,30 +84,53 @@ const MAX_MIX_CHUNK_SAMPLES: u64 = 16_000;
 // Absorb timestamp/resampler rounding only, not callback scheduling jitter.
 const TIMESTAMP_ROUNDING_SAMPLES: u64 = 2;
 
-/// WASAPI capture and callback timestamps share the machine's QPC clock.
-/// Calibrate that clock to recording start ONCE, not once per device/packet.
-/// Capture timestamps (not delivery time) then preserve pauses and late packets.
+// Device timestamps must not manufacture audio ahead of real capture time.
+const CAPTURE_CLOCK_TOLERANCE: Duration = Duration::from_millis(250);
+
+/// WASAPI GetPosition can return a zero/stale callback timestamp at startup,
+/// even though GetBuffer supplies a valid QPC capture timestamp. Use the later
+/// timestamp for ONE shared anchor; never treat callback=0 as system boot time.
 struct CaptureClock {
     started_at: Instant,
-    origin: Option<cpal::StreamInstant>,
+    anchor: Option<(cpal::StreamInstant, Duration)>,
+}
+
+fn capture_clock_elapsed(
+    anchor_elapsed: Duration,
+    forward: Option<Duration>,
+    backward: Option<Duration>,
+    observed_elapsed: Duration,
+) -> Result<Duration, String> {
+    let elapsed = if let Some(forward) = forward {
+        anchor_elapsed.checked_add(forward)
+            .ok_or_else(|| "Audio capture clock is out of range".to_string())?
+    } else {
+        let backward = backward.ok_or_else(|| "Audio capture clock is invalid".to_string())?;
+        if backward > anchor_elapsed.saturating_add(CAPTURE_CLOCK_TOLERANCE) {
+            return Err("Audio capture timestamp moved before the recording clock; capture stopped to preserve timing.".into());
+        }
+        anchor_elapsed.saturating_sub(backward)
+    };
+    if elapsed > observed_elapsed.saturating_add(CAPTURE_CLOCK_TOLERANCE) {
+        return Err("Audio capture timestamp jumped ahead of real time; capture stopped to avoid generating invalid silence.".into());
+    }
+    Ok(elapsed)
 }
 
 impl CaptureClock {
-    fn new() -> Self {
-        Self { started_at: Instant::now(), origin: None }
+    fn new(started_at: Instant) -> Self {
+        Self { started_at, anchor: None }
     }
 
     fn position(&mut self, timestamp: cpal::InputStreamTimestamp, observed_at: Instant) -> Result<u64, String> {
-        let origin = match self.origin {
-            Some(origin) => origin,
-            None => {
-                let origin = timestamp.callback.sub(observed_at.saturating_duration_since(self.started_at))
-                    .ok_or_else(|| "Audio capture clock is out of range".to_string())?;
-                self.origin = Some(origin);
-                origin
-            }
-        };
-        let elapsed = timestamp.capture.duration_since(&origin).unwrap_or_default();
+        let observed_elapsed = observed_at.saturating_duration_since(self.started_at);
+        let (anchor, anchor_elapsed) = *self.anchor.get_or_insert_with(|| {
+            (timestamp.capture.max(timestamp.callback), observed_elapsed)
+        });
+        let elapsed = capture_clock_elapsed(
+            anchor_elapsed, timestamp.capture.duration_since(&anchor),
+            anchor.duration_since(&timestamp.capture), observed_elapsed,
+        )?;
         Ok(((elapsed.as_nanos() * 16_000 + 500_000_000) / 1_000_000_000) as u64)
     }
 }
@@ -149,6 +172,16 @@ impl AlignedSource {
     }
 
     fn sample_at(&mut self, index: u64) -> f32 {
+        // A committed prefix must never pin the front packet forever. Only
+        // remove indices already passed by the mixer, retaining any live tail.
+        while let Some(packet) = self.packets.front_mut() {
+            let stale = index.saturating_sub(packet.start).min(packet.samples.len() as u64) as usize;
+            packet.samples.drain(..stale);
+            packet.start += stale as u64;
+            self.queued_samples -= stale;
+            if !packet.samples.is_empty() { break; }
+            self.packets.pop_front();
+        }
         let Some(packet) = self.packets.front_mut() else { return 0.0; };
         if packet.start != index { return 0.0; }
         packet.start += 1;
@@ -216,13 +249,29 @@ impl AlignedMixer {
 /// buffers/level meters. Only the persistence task drains this mixer.
 pub(crate) struct RecordingCapture {
     mixer: AlignedMixer,
-    clock: CaptureClock,
+    clock: Option<CaptureClock>,
+    stopped: bool,
     error: Option<String>,
 }
 
 impl RecordingCapture {
     pub(crate) fn new(microphone: bool, system: bool) -> Self {
-        Self { mixer: AlignedMixer::new(microphone, system), clock: CaptureClock::new(), error: None }
+        Self { mixer: AlignedMixer::new(microphone, system), clock: None, stopped: false, error: None }
+    }
+
+    fn start(&mut self, started_at: Instant) -> Result<(), String> {
+        if self.stopped || self.clock.is_some() {
+            return Err("Audio capture startup was cancelled or already completed".into());
+        }
+        if let Some(error) = &self.error { return Err(error.clone()); }
+        self.clock = Some(CaptureClock::new(started_at));
+        Ok(())
+    }
+
+    // Freeze admission before draining, including when device teardown hangs.
+    // Already accepted packets and the fatal error latch remain untouched.
+    pub(crate) fn stop(&mut self) {
+        self.stopped = true;
     }
 
     pub(crate) fn error(&self) -> Option<&str> {
@@ -290,8 +339,11 @@ impl CaptureTarget {
             }
             Self::Recording(capture) => {
                 if let Ok(mut capture) = capture.lock() {
-                    if capture.error.is_none() {
-                        let result = capture.clock.position(timestamp, observed_at)
+                    if !capture.stopped && capture.error.is_none() {
+                        // Constructed streams are paused. No recording clock
+                        // exists until the owning thread is about to play them.
+                        let Some(clock) = capture.clock.as_mut() else { return; };
+                        let result = clock.position(timestamp, observed_at)
                             .and_then(|start| capture.mixer.push(source, start, samples, muted));
                         if let Err(error) = result {
                             capture.error = Some(error);
@@ -425,6 +477,120 @@ fn default_audio_input_device(host: &cpal::Host) -> Result<cpal::Device, String>
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn capture_clock_rejects_uptime_silence_but_preserves_real_pauses_and_delayed_packets() {
+        let initial = Duration::from_millis(40);
+        // A first-packet anchor has no delta, regardless of machine uptime.
+        assert_eq!(capture_clock_elapsed(initial, Some(Duration::ZERO), None, initial).unwrap(), initial);
+        assert!(capture_clock_elapsed(initial, Some(Duration::from_secs(26_349)), None, initial).is_err());
+        let later = Duration::from_secs(65);
+        assert_eq!(capture_clock_elapsed(initial, Some(later), None, later + initial).unwrap(), later + initial);
+        // Callback delivery delay must NOT shift an old packet to now.
+        assert_eq!(capture_clock_elapsed(initial, Some(Duration::from_secs(1)), None, later).unwrap(), Duration::from_millis(1040));
+        assert_eq!(capture_clock_elapsed(initial, None, Some(Duration::from_millis(50)), initial).unwrap(), Duration::ZERO);
+        assert!(capture_clock_elapsed(initial, None, Some(Duration::from_secs(26_349)), later).is_err());
+    }
+
+    #[test]
+    #[ignore = "LOCAL LOOPBACK DIAGNOSTIC: plays synthetic tone; records timestamp metadata only, no cloud or files"]
+    fn wasapi_timestamp_diagnostic() {
+        let host = audio_host();
+        let device = host.default_output_device().expect("Default output device");
+        let config = device.default_output_config().unwrap();
+        assert_eq!(config.sample_format(), cpal::SampleFormat::F32);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let stream = device.build_input_stream(&config.into(), move |_: &[f32], info: &cpal::InputCallbackInfo| {
+            let ts = info.timestamp();
+            let _ = tx.send((started.elapsed(), ts));
+        }, |e| eprintln!("loopback error: {e}"), None).unwrap();
+        stream.play().unwrap();
+        let (_output, handle) = OutputStream::try_default().unwrap();
+        let sink = Sink::try_new(&handle).unwrap();
+        use rodio::Source;
+        sink.append(rodio::source::SineWave::new(440.0).amplify(0.01).take_duration(Duration::from_secs(2)));
+        for _ in 0..8 {
+            let (elapsed, timestamp) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            eprintln!("WASAPI elapsed={elapsed:?} capture={:?} callback={:?} capture_after_callback={:?}",
+                timestamp.capture, timestamp.callback, timestamp.capture.duration_since(&timestamp.callback));
+        }
+        sink.stop();
+        drop(stream);
+    }
+
+    #[test]
+    fn slow_preparation_has_no_clock_or_backlog_and_play_uses_one_epoch() {
+        let capture = Arc::new(Mutex::new(RecordingCapture::new(true, true)));
+        // Simulate preparation lasting far beyond the two-second buffer cap,
+        // without sleeping or opening devices. Only play establishes time zero.
+        let prepared_at = Instant::now() - Duration::from_secs(60);
+        {
+            let mut capture = capture.lock().unwrap();
+            assert!(capture.clock.is_none());
+            assert!(capture.drain(false).unwrap().is_empty());
+        }
+        let mut played = Vec::new();
+        let mut epochs = Vec::new();
+        let started_at = start_recording_sources(&["microphone", "system"], &capture, |source| {
+            played.push(*source);
+            let mut capture = capture.lock().unwrap();
+            epochs.push(capture.clock.as_ref().unwrap().started_at);
+            if *source == "microphone" {
+                capture.mixer.push(AudioSource::Microphone, 0, &[0.5; 320], false).unwrap();
+            } else {
+                capture.mixer.push(AudioSource::System, 160, &[0.5; 320], false).unwrap();
+            }
+            Ok(())
+        }).unwrap();
+        assert_eq!(played, ["microphone", "system"]);
+        assert_eq!(epochs, [started_at, started_at]);
+        assert!(started_at.duration_since(prepared_at) >= Duration::from_secs(60));
+        let mixed = capture.lock().unwrap().drain(true).unwrap();
+        assert_eq!(mixed.len(), 480); // No minute of artificial startup silence.
+        for (range, value) in [(0..160, 0.3), (160..320, 0.5), (320..480, 0.2)] {
+            assert!(mixed[range].iter().all(|&s| pcm16_sample(s) == pcm16_sample(value)));
+        }
+        assert!(start_recording_sources(&[()], &capture, |_| panic!("must not restart")).is_err());
+    }
+
+    #[test]
+    fn cancelled_start_never_plays_and_partial_play_failure_keeps_accepted_tail() {
+        let capture = Arc::new(Mutex::new(RecordingCapture::new(true, true)));
+        capture.lock().unwrap().stop();
+        assert!(start_recording_sources(&[()], &capture, |_| panic!("cancelled start played")).is_err());
+        assert!(capture.lock().unwrap().clock.is_none());
+
+        let capture = Arc::new(Mutex::new(RecordingCapture::new(true, true)));
+        let result = start_recording_sources(&["microphone", "system"], &capture, |source| {
+            if *source == "system" { return Err("synthetic play failure".into()); }
+            capture.lock().unwrap().mixer.push(AudioSource::Microphone, 0, &[0.5; 320], false)
+        });
+        assert_eq!(result.unwrap_err(), "synthetic play failure");
+        let mut capture = capture.lock().unwrap();
+        assert!(capture.stopped);
+        let tail = capture.drain(true).unwrap();
+        assert_eq!(tail.len(), 320);
+        assert!(tail.iter().all(|&s| pcm16_sample(s) == pcm16_sample(0.3)));
+    }
+
+    #[test]
+    fn stale_front_packets_release_only_committed_prefix_and_do_not_pin_queue() {
+        let mut source = AlignedSource::default();
+        source.push(0, &[0.1, 0.2], 0, false).unwrap();
+        source.push(5, &[0.3, 0.4, 0.5], 0, false).unwrap();
+        // Defensive invariant test: simulate a cursor already beyond a queued
+        // packet. Normal push/drain currently prevents this state.
+        assert_eq!(source.sample_at(6), 0.4);
+        assert_eq!(source.queued_samples, 1);
+        assert_eq!(source.sample_at(7), 0.5);
+        assert_eq!(source.queued_samples, 0);
+        assert!(source.packets.is_empty());
+        source.push(12, &[0.75; MAX_CAPTURE_SOURCE_SAMPLES], 8, false).unwrap();
+        assert_eq!(source.sample_at(8), 0.0); // Future audio must not shift.
+        assert_eq!(source.queued_samples, MAX_CAPTURE_SOURCE_SAMPLES);
+        assert_eq!(source.sample_at(12), 0.75);
+    }
 
     #[test]
     fn muted_microphone_samples_preserve_length_as_silence() {
@@ -857,6 +1023,42 @@ pub(crate) fn build_recording_streams(
     )
 }
 
+/// Recording streams stay paused through metadata and writer setup. Keep this
+/// on their owning thread; microphone is first, loopback second, on ONE clock.
+/// A play failure is fatal (unlike an optional loopback construction failure),
+/// since the resolved capture mode has already been persisted at this point.
+pub(crate) fn start_recording_streams(
+    streams: &[cpal::Stream],
+    capture: &Arc<Mutex<RecordingCapture>>,
+) -> Result<Instant, String> {
+    start_recording_sources(streams, capture, |stream| stream.play().map_err(|error| error.to_string()))
+}
+
+fn start_recording_sources<T>(
+    streams: &[T],
+    capture: &Arc<Mutex<RecordingCapture>>,
+    mut play: impl FnMut(&T) -> Result<(), String>,
+) -> Result<Instant, String> {
+    let started_at = {
+        let mut capture = capture.lock().map_err(|_| "Recording sample buffer lock poisoned".to_string())?;
+        let started_at = Instant::now();
+        capture.start(started_at)?;
+        started_at
+    };
+    for stream in streams {
+        {
+            let capture = capture.lock().map_err(|_| "Recording sample buffer lock poisoned".to_string())?;
+            if capture.stopped { return Err("Audio capture startup was cancelled".into()); }
+            if let Some(error) = capture.error() { return Err(error.to_string()); }
+        }
+        if let Err(error) = play(stream) {
+            if let Ok(mut capture) = capture.lock() { capture.stop(); }
+            return Err(error);
+        }
+    }
+    Ok(started_at)
+}
+
 fn build_capture_streams_for_target(
     capture_microphone: bool,
     capture_system: bool,
@@ -885,7 +1087,9 @@ fn build_capture_streams_for_target(
             target.clone(),
             microphone_muted.clone(),
         )?;
-        stream.play().map_err(|error| error.to_string())?;
+        if matches!(&target, CaptureTarget::Raw(..)) {
+            stream.play().map_err(|error| error.to_string())?;
+        }
         streams.push(stream);
         setup.resolved_audio_device_id = device_id;
         setup.audio_device_name = device_name;
@@ -904,7 +1108,9 @@ fn build_capture_streams_for_target(
                     target.clone(),
                     microphone_muted.clone(),
                 )?;
-                stream.play().map_err(|error| error.to_string())?;
+                if matches!(&target, CaptureTarget::Raw(..)) {
+                    stream.play().map_err(|error| error.to_string())?;
+                }
                 Ok((stream, device_id, device_name))
             },
         ) {
