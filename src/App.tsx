@@ -275,6 +275,7 @@ export default function App() {
   const fastTranscribingRef = useRef(false);
   const fastConsentRef = useRef<{ file: FastTranscriptionFile; meetingId: string | null } | null>(null);
   const stopRecordingPromiseRef = useRef<Promise<void> | null>(null);
+  const meetingSelectionRequestRef = useRef(0);
   const recordingAttemptRef = useRef<RecordingAttempt | null>(null);
   const recordingListenersReadyRef = useRef<Promise<void>>(Promise.resolve());
   const settingsLoadedRef = useRef(false);
@@ -310,7 +311,7 @@ export default function App() {
     // Do not await from inside startup: stop is serialized behind that operation.
     // The failure latch and the shared stop promise coalesce repeated events and
     // a simultaneous user Stop without starting a cloud recovery/transcription.
-    void handleStopRecording(attempt).catch(() => surfaceRecordingFailure(attempt));
+    void stopRecordingAttempt(attempt).catch(() => surfaceRecordingFailure(attempt));
   }
 
   function identifyRecordingAttempt(attempt: RecordingAttempt, meetingId: string) {
@@ -902,7 +903,7 @@ export default function App() {
         // and user Stop. Never await it here: it runs after startup settles.
         if (recordingMeetingIdRef.current) {
           setError(message);
-          void handleStopRecording(attempt).catch(() => surfaceRecordingFailure(attempt));
+          void stopRecordingAttempt(attempt).catch(() => surfaceRecordingFailure(attempt));
           return;
         }
         if (!recordingMeetingIdRef.current) {
@@ -1016,20 +1017,27 @@ export default function App() {
     }
   };
 
-  const handleStopRecording = (expectedAttempt = recordingAttemptRef.current): Promise<void> => {
+  // DOM event handlers must never accept the attempt identity as an argument:
+  // React supplies a MouseEvent, which would fail the stale-attempt guard.
+  const handleStopRecording = (): Promise<void> => stopRecordingAttempt(recordingAttemptRef.current);
+
+  const stopRecordingAttempt = (expectedAttempt: RecordingAttempt | null): Promise<void> => {
     if (expectedAttempt !== recordingAttemptRef.current) return Promise.resolve();
     if (stopRecordingPromiseRef.current) {
       return stopRecordingPromiseRef.current;
     }
     const operation = enqueueRecordingOperation(async () => {
-      if (expectedAttempt !== recordingAttemptRef.current || !recordingMeetingIdRef.current) {
+      if (expectedAttempt !== recordingAttemptRef.current) {
         if (expectedAttempt) surfaceRecordingFailure(expectedAttempt);
         return;
       }
       setStatus('saving');
       stopTimers();
       try {
-        const meeting = await stopNativeRecording();
+        // A stale UI identity is not proof of native capture. No-op native stop
+        // would otherwise throw and leave the user stuck in the switch dialog.
+        const runtime = await getRecordingRuntimeStatus();
+        const meeting = runtime.audioRecordingActive ? await stopNativeRecording() : null;
         recordingMeetingIdRef.current = null;
         // Native stop waits for the last PCM emission. Only now remove the
         // listener and close the stream; stop also awaits final transcript writes.
@@ -1038,14 +1046,14 @@ export default function App() {
         await closeAzurePipe(pipe);
         setAzurePartialText('');
         setMicrophoneMuted(false);
-        setMeetings((current) => upsertMeeting(current, meeting));
+        if (meeting) setMeetings((current) => upsertMeeting(current, meeting));
         // Native's stop result predates the recognizer's final persisted text.
         const persisted = await fetchMeetings();
-        const finalMeeting = persisted.find((item) => item.id === meeting.id);
+        const finalMeeting = persisted.find((item) => item.id === meeting?.id);
         if (finalMeeting) setMeetings((current) => upsertMeeting(current, finalMeeting));
         setStatus('idle');
       } catch (stopError) {
-        let message = stopError instanceof Error ? stopError.message : 'Failed to stop recording.';
+        let message = getErrorMessage(stopError, 'Failed to stop recording.');
         // A native finalization error can occur AFTER capture has stopped.
         // Conversely, never detach live PCM if capture really is still active.
         if (recordingMeetingIdRef.current) {
@@ -1316,19 +1324,65 @@ export default function App() {
     }
   };
 
-  const handleSelectMeeting = (meetingId: string) => {
+  const handleSelectMeeting = async (meetingId: string) => {
+    // Selecting a recording also leaves other workspaces, including when the
+    // requested recording is already selected underneath Settings.
+    setShowSettings(false);
+    setShowBatchTranscription(false);
+    setShowVideoWorkspace(false);
     if (meetingId === activeMeetingId) {
       return;
     }
     revokeFastConsent();
-    if (status !== 'idle' || recordingMeetingIdRef.current || recordingOperationsRef.current) {
-      setPendingMeetingId(meetingId);
+    // Loading settings/device lists uses the same queue, but is NOT recording.
+    // Only a confirmed native session should produce a destructive-stop warning.
+    if (status === 'starting' || status === 'saving' || stopRecordingPromiseRef.current) {
+      setError('Recording is starting or finishing. Wait for it to complete before switching meetings.');
       return;
     }
-    setActiveMeetingId(meetingId);
+    const request = ++meetingSelectionRequestRef.current;
+    // Browsing saved data is not a native recording operation. Do not block
+    // Ready navigation on device/recovery locks; startup reconciles any native
+    // session independently. Stale/live recording refs still use guarded cleanup.
+    if (status === 'idle' && !recordingMeetingIdRef.current && !azurePipeRef.current) {
+      setPendingMeetingId(null);
+      setActiveMeetingId(meetingId);
+      return;
+    }
+    const attempt = recordingAttemptRef.current;
+    const queue = recordingQueueRef.current;
+    try {
+      const runtime = await getRecordingRuntimeStatus();
+      if (request !== meetingSelectionRequestRef.current || attempt !== recordingAttemptRef.current
+        || queue !== recordingQueueRef.current) return;
+      if (runtime.audioRecordingActive) {
+        if (!runtime.audioMeetingId) throw new Error('Native recording identity is unavailable. Retry after initialization.');
+        recordingMeetingIdRef.current = runtime.audioMeetingId;
+        if (!attempt || attempt.meetingId !== runtime.audioMeetingId) {
+          identifyRecordingAttempt(beginRecordingAttempt(), runtime.audioMeetingId);
+        }
+        setStatus('recording');
+        if (!elapsedTimerRef.current) startTimers();
+        setPendingMeetingId(meetingId);
+      } else {
+        // Preserve normal serialized Azure drain when repairing an orphaned UI
+        // session. Do not issue stop_recording when native is already idle.
+        if (recordingMeetingIdRef.current || azurePipeRef.current) await handleStopRecording();
+        if (request !== meetingSelectionRequestRef.current || recordingMeetingIdRef.current) return;
+        stopTimers();
+        setStatus('idle');
+        setPendingMeetingId(null);
+        setActiveMeetingId(meetingId);
+      }
+    } catch (selectionError) {
+      if (request === meetingSelectionRequestRef.current) {
+        setError(getErrorMessage(selectionError, 'Could not confirm recording status. Retry switching meetings.'));
+      }
+    }
   };
 
   const handleCancelSwitch = () => {
+    meetingSelectionRequestRef.current += 1;
     setPendingMeetingId(null);
   };
 

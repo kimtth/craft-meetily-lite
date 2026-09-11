@@ -10,14 +10,11 @@ capture, local file I/O, Foundry Local speech recognition, and screen recording.
 React provides the UI and the Azure Speech live-recognition client. If you usually
 work in Python, use this guide to connect familiar ideas to the actual backend.
 
-The local speech engine is **Foundry Local**, not the earlier Whisper integration.
+The local speech engine is **Foundry Local**.
 **Meeting Assistant** is the feature name; GitHub Copilot is its optional cloud
 provider. Neither the assistant nor Azure Speech is required for local recording.
 
-This guide describes the implementation reviewed on 2026-09-09. Consult
-[Architecture.md](../Architecture.md) for broader design and
-[UNCONFIRMED_ASSUMPTIONS.md](../UNCONFIRMED_ASSUMPTIONS.md) for approval and
-validation boundaries; code inspection does not prove live device or cloud behavior.
+Consult [Architecture.md](../Architecture.md) for broader design.
 
 ## Backend Module Map
 

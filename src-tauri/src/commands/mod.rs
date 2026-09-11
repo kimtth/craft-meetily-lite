@@ -107,7 +107,10 @@ fn fast_transcription_file_details(path: &Path) -> Result<(String, u64, Duration
         Decoder::new(BufReader::new(file))
             .map_err(|error| format!("Could not read the selected audio file: {error}"))?
             .total_duration()
-            .ok_or_else(|| "Could not determine the selected audio duration.".to_string())?
+            // MP3 decoders can return None for valid audio. As with MP4,
+            // let Azure validate unknown durations and return the actual length;
+            // do not decode the entire recording just to select/upload it.
+            .unwrap_or(Duration::ZERO)
     };
     if duration > FAST_TRANSCRIPTION_MAX_DURATION {
         return Err(
@@ -116,6 +119,46 @@ fn fast_transcription_file_details(path: &Path) -> Result<(String, u64, Duration
         );
     }
     Ok((extension, metadata.len(), duration))
+}
+
+#[cfg(test)]
+mod fast_transcription_file_tests {
+    use super::*;
+
+    #[test]
+    fn wav_duration_and_invalid_audio_validation_are_preserved() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("audio.wav");
+        let mut writer = hound::WavWriter::create(&path, hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        }).unwrap();
+        for _ in 0..16_000 {
+            writer.write_sample(0_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        assert_eq!(fast_transcription_file_details(&path).unwrap().2, Duration::from_secs(1));
+
+        let mp3 = folder.path().join("invalid.mp3");
+        fs::write(&mp3, []).unwrap();
+        assert!(fast_transcription_file_details(&mp3).unwrap_err().contains("empty"));
+        fs::write(&mp3, b"not audio").unwrap();
+        assert!(fast_transcription_file_details(&mp3).unwrap_err().contains("Could not read"));
+    }
+
+    #[test]
+    #[ignore = "Read-only local MP3 regression; set MEETLY_TEST_MP3_PATH. No upload."]
+    fn local_mp3_with_unknown_duration_is_accepted() {
+        let path = PathBuf::from(std::env::var_os("MEETLY_TEST_MP3_PATH").expect("Set MEETLY_TEST_MP3_PATH"));
+        let decoder = Decoder::new(BufReader::new(fs::File::open(&path).unwrap())).unwrap();
+        assert_eq!(decoder.total_duration(), None, "Use an MP3 with unknown decoder duration");
+        let (extension, bytes, duration) = fast_transcription_file_details(&path).unwrap();
+        assert_eq!(extension, "mp3");
+        assert!(bytes > 0);
+        assert_eq!(duration, Duration::ZERO);
+    }
 }
 
 pub(crate) fn fast_transcription_endpoint(endpoint: &str) -> Result<reqwest::Url, String> {
