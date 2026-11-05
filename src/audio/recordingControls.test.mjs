@@ -232,6 +232,26 @@ test('real button click runs the real stop path and coalesces simultaneous Stop 
   assert.equal(h.timers.size, 0);
 });
 
+for (const originalError of [null, 'Azure Speech connection failed: endpoint not found.']) {
+  test(`buffered audio warning retains the original startup failure (${originalError !== null})`, async () => {
+    const h = harness({
+      status: 'recording', attempt: attemptFor('live'), recordingId: 'live',
+      runtime: () => active(),
+    });
+    h.state.error = originalError;
+    const pipe = h.pipe();
+    pipe.session = null;
+    pipe.chunks.push({ meetingId: 'live', pcmBase64: 'AAA=', offsetSeconds: 0 });
+    await h.api.handleStopRecording();
+    assert.match(h.state.error, /Some buffered audio could not be transcribed live/);
+    if (originalError) assert.ok(h.state.error.startsWith(originalError));
+    assert.equal(h.state.status, 'idle');
+    assert.equal(pipe.closed, true);
+    assert.equal(h.refs.azurePipeRef.current, null);
+    assert.equal(h.count('native.stop'), 1);
+  });
+}
+
 for (const sharedStop of [false, true]) {
   test(`stopRecordingAttempt rejects foreign identities BEFORE queue/shared-stop checks (shared=${sharedStop})`, async () => {
     const attempt = attemptFor('live');

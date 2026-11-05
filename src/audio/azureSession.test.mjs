@@ -402,6 +402,24 @@ test('throwing onError cannot interrupt cancellation cleanup', async () => {
   h.assertDisposed();
 });
 
+test('network startup failure gives endpoint guidance and retains the original error', async () => {
+  const h = harness({ onStart: (_, __, reject) => reject(new TypeError('Failed to fetch')) });
+  await assert.rejects(h.start(), /Failed to fetch.*custom domain endpoint.*DNS\/network/);
+  assert.equal(h.errors.length, 1);
+  assert.match(h.errors[0], /Azure CLI sign-in alone does not verify the Speech endpoint/);
+  h.assertDisposed();
+});
+
+test('PCM sent after a service failure reports the failure instead of silently dropping audio', async () => {
+  const h = harness();
+  const session = await h.start();
+  h.cancel(0, 'WebSocket connection failed');
+  assert.throws(() => session.pushPcmBase64('AAA=', 0), /WebSocket connection failed.*DNS\/network/);
+  assert.equal(h.writes.length, 0);
+  await assert.rejects(session.stop(), /WebSocket connection failed/);
+  h.assertDisposed();
+});
+
 test('input close failure rejects as incomplete and still disposes', async () => {
   const h = harness({ onInputClose() { throw new Error('input close failed'); } });
   const session = await h.start();

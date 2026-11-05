@@ -41,6 +41,8 @@ npm run tauri:dev
 
 > Azure Speech uploads audio to the cloud. Use Foundry Local to keep transcription on-device.
 
+If live Azure transcription fails, check the original error shown alongside the buffered-audio warning. The Speech custom domain endpoint in Settings must resolve in DNS and be reachable from this computer; successful Azure CLI sign-in does not verify that endpoint. Copy the endpoint from the Speech resource's **Keys and Endpoint** page, then retry. Saved audio remains available for retranscription.
+
 ## Meeting Assistant
 
 Ask questions during or after recording, generate recaps and action items, and follow timestamped citations back to the recording.

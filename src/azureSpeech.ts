@@ -115,7 +115,11 @@ export async function startAzureSpeechSession(options: AzureSpeechOptions): Prom
 
   const recordFailure = (error: unknown) => {
     if (!failure) {
-      failure = new Error(`Azure Speech transcription may be incomplete: ${error instanceof Error ? error.message : String(error)}`);
+      const detail = error instanceof Error ? error.message : String(error);
+      const guidance = /failed to fetch|fetch failed|networkerror|enotfound|websocket|connection failed/i.test(detail)
+        ? ' Check the Speech custom domain endpoint in Settings and its DNS/network access. Azure CLI sign-in alone does not verify the Speech endpoint.'
+        : '';
+      failure = new Error(`Azure Speech transcription may be incomplete: ${detail}${guidance}`);
       // A consumer's error callback must not prevent cleanup or escape into
       // the SDK's receive loop (which can otherwise stop delivering events).
       try { options.onError?.(failure.message); } catch { /* best-effort notification */ }
@@ -239,6 +243,7 @@ export async function startAzureSpeechSession(options: AzureSpeechOptions): Prom
 
   return {
     pushPcmBase64: (pcmBase64: string, offsetSeconds?: number) => {
+      if (failure) throw failure;
       if (!closed && !stopping) {
         const bytes = decodeBase64(pcmBase64);
         const skipSamples = timeline.append(bytes.byteLength, offsetSeconds);

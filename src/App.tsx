@@ -1042,7 +1042,12 @@ export default function App() {
         // Native stop waits for the last PCM emission. Only now remove the
         // listener and close the stream; stop also awaits final transcript writes.
         const pipe = azurePipeRef.current;
-        if (pipe?.chunks.length) setError('Some buffered audio could not be transcribed live. The saved audio can be retranscribed.');
+        if (pipe?.chunks.length) {
+          setError((current) => {
+            const recovery = 'Some buffered audio could not be transcribed live. The saved audio can be retranscribed.';
+            return current ? `${current} ${recovery}` : recovery;
+          });
+        }
         await closeAzurePipe(pipe);
         setAzurePartialText('');
         setMicrophoneMuted(false);
